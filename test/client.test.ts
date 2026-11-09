@@ -3,6 +3,7 @@ import {
   FALLBACK_HEADER,
   LATENCY_BUCKETS,
   latencyBucket,
+  type PromptConfig,
   type PromptExperiment,
   PromptHelm,
   PromptHelmError,
@@ -16,7 +17,10 @@ const TTL = 60_000;
 
 /** Stands in for the API: one prompt, "greeting", with ETag support. */
 function fakeApi() {
-  let live = { version: 1, content: "Hello {{name}}" };
+  let live: { version: number; content: string; config?: PromptConfig } = {
+    version: 1,
+    content: "Hello {{name}}",
+  };
   let experiment: PromptExperiment | undefined;
   let down = false;
   let reportStatus = 204;
@@ -47,7 +51,15 @@ function fakeApi() {
       return new Response(null, { status: 304, headers: { etag } });
     }
     return Response.json(
-      { slug: "greeting", version: live.version, content: live.content, variables: [], experiment },
+      {
+        slug: "greeting",
+        version: live.version,
+        content: live.content,
+        variables: [],
+        // Left out when unset, as a server before 1.4 does.
+        ...(live.config && { config: live.config }),
+        experiment,
+      },
       { headers: { etag } },
     );
   });
@@ -59,15 +71,22 @@ function fakeApi() {
     answerReports(status: number) {
       reportStatus = status;
     },
-    publish(content: string) {
-      live = { version: live.version + 1, content };
+    publish(content: string, config?: PromptConfig) {
+      live = { version: live.version + 1, content, ...(config && { config }) };
     },
     /** Runs an A/B test with `content` as the next version, or ends it. */
-    experiment(test: { id?: string; weight: number; content: string } | undefined) {
+    experiment(
+      test: { id?: string; weight: number; content: string; config?: PromptConfig } | undefined,
+    ) {
       experiment = test && {
         id: test.id ?? "exp-1",
         weight: test.weight,
-        variant: { version: live.version + 1, content: test.content, variables: [] },
+        variant: {
+          version: live.version + 1,
+          content: test.content,
+          variables: [],
+          ...(test.config && { config: test.config }),
+        },
       };
     },
     setDown(value: boolean) {
@@ -211,6 +230,57 @@ describe("PromptHelm.get", () => {
     const slow = new PromptHelm({ apiKey: KEY, timeout: 10, fetch: hanging });
     await expect(slow.get("greeting")).rejects.toBeInstanceOf(PromptHelmError);
     await expect(slow.get("greeting")).rejects.toMatchObject({ code: "timeout" });
+  });
+});
+
+describe("model settings", () => {
+  const client = (api: ReturnType<typeof fakeApi>) =>
+    new PromptHelm({
+      apiKey: KEY,
+      baseUrl: "https://ph.test",
+      fetch: api.fetch,
+      onError: () => {},
+    });
+
+  it("come with the version served, and a caller's changes don't reach the cache", async () => {
+    const api = fakeApi();
+    api.publish("Hi {{name}}", { model: "gpt-5-mini", temperature: 0.2, maxTokens: 400 });
+    const ph = client(api);
+
+    const r = await ph.resolve("greeting", { vars: { name: "Ayşe" } });
+    expect(r).toMatchObject({
+      text: "Hi Ayşe",
+      config: { model: "gpt-5-mini", temperature: 0.2, maxTokens: 400 },
+    });
+    r.config.model = "changed";
+    expect((await ph.resolve("greeting", { vars: { name: "Ayşe" } })).config.model).toBe(
+      "gpt-5-mini",
+    );
+  });
+
+  it("are empty from a server that sends none, and when the fallback is served", async () => {
+    const api = fakeApi();
+    expect((await client(api).resolve("greeting", { vars: { name: "Ayşe" } })).config).toEqual({});
+
+    api.setDown(true);
+    const down = await client(api).resolve("greeting", { fallback: "Hey" });
+    expect(down).toMatchObject({ text: "Hey", version: null, config: {} });
+  });
+
+  it("follow the side of an A/B test a call gets, and the live version when the variant can't be filled in", async () => {
+    const api = fakeApi();
+    api.publish("Hi {{name}}", { model: "gpt-5" });
+    api.experiment({ weight: 99, content: "Hey {{name}}", config: { model: "gpt-5-mini" } });
+    const ph = client(api);
+
+    const variant = await ph.resolve("greeting", { vars: { name: "a" }, force: "variant" });
+    const control = await ph.resolve("greeting", { vars: { name: "a" }, force: "control" });
+    expect([variant.config, control.config]).toEqual([{ model: "gpt-5-mini" }, { model: "gpt-5" }]);
+
+    // A fresh client, so the changed test is fetched rather than served from cache.
+    api.experiment({ weight: 99, content: "Hey {{name}} in {{city}}", config: { model: "x" } });
+    const skipped = await client(api).resolve("greeting", { vars: { name: "a" }, unit: "user-1" });
+    expect(skipped).toMatchObject({ text: "Hi a", config: { model: "gpt-5" } });
   });
 });
 
