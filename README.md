@@ -14,7 +14,7 @@ refresh, 60 seconds by default.
   a refresh that finds nothing new is an empty `304`.
 - **Your data stays with you.** Variables are filled in on your server. PromptHelm never sees
   their values, your provider keys or your LLM traffic.
-- **Small.** No dependencies, under 2 kB gzipped, ESM and CommonJS, Node.js 18 and later.
+- **Small.** No dependencies, under 3 kB gzipped, ESM and CommonJS, Node.js 18 and later.
 
 ## Install
 
@@ -60,6 +60,7 @@ All optional when the environment variables are set.
 | `timeout` | `3000`                                            | How long, in ms, one request may take.                               |
 | `onError` | `console.warn`                                    | Called with the error and the slug when a fallback or a cached prompt was served instead of failing. |
 | `reportFallbacks` | `true`                                  | Tells PromptHelm, by error code only, when a fallback or a cached prompt was served, so the prompt's page shows which app fell back and why. |
+| `reportResults` | `reportFallbacks`                           | During an [A/B test](#ab-tests), tells PromptHelm how many times each version was served, as counts only. |
 | `fetch`   | global `fetch`                                    | Your own fetch, for tests or a proxy.                                |
 
 ## Errors
@@ -105,6 +106,42 @@ const system = await ph.get("support-reply", {
 Run it in CI before the build, so every deploy carries the text that was live then. It reads
 `PROMPTHELM_API_KEY` (and `PROMPTHELM_BASE_URL`), and writes JSON for a `.json` path or with
 `--format json`. A prompt appears in the file once it's published.
+
+## A/B tests
+
+On the Pro plan, a prompt's page can run an experiment: the live version keeps most calls and a
+variant gets the share you pick. The SDK picks the version for each call on your server. Pass a
+`unit`, such as a user or conversation id, and that unit gets the same version every time;
+without one, each call is picked at random. `resolve` returns the text with the version it
+served, so you can tag your logs or traces with it and compare the two:
+
+```ts
+const { text, version } = await ph.resolve("support-reply", {
+  vars: { company: "Acme", customer_name: user.name },
+  fallback: SUPPORT_REPLY,
+  unit: user.id,
+});
+
+// With OpenTelemetry, or however you log your model calls. `version` is null for the fallback.
+span.setAttribute("prompthelm.version", version ?? "fallback");
+```
+
+If the variant uses a variable the call doesn't pass, that call gets the live version and
+`onError` receives `missing_variables`; it isn't reported as a fallback. Growing the variant's
+share only moves units from the live version to the variant, never back.
+
+While an experiment runs, the next request for its slug carries how many times each version was
+served (`x-prompthelm-results`), so the prompt's page shows the variant reaching your app. Only
+counts are sent, never the text, a variable's value or the unit. Counts a process holds when it
+exits are lost, so read them as a sample. `reportResults: false` sends none; unless you set it,
+it follows `reportFallbacks`.
+
+Apps on SDK versions before 1.3 ignore experiments and serve the live version to every call.
+
+To split calls the same way from another language: during an experiment the response carries
+`experiment: { id, weight, variant: { version, content, variables } }`. A unit's bucket is the
+32-bit FNV-1a hash of the UTF-8 bytes of `<experiment id>:<unit>`, modulo 100; buckets below
+`weight` get the variant.
 
 ## Other languages
 
