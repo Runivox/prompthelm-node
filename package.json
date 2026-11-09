@@ -37,7 +37,7 @@
     }
   },
   "bin": {
-    "prompthelm": "./dist/cli.js"
+    "prompthelm": "dist/cli.js"
   },
   "files": [
     "dist"
