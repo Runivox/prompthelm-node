@@ -27,17 +27,28 @@ for (const [format, sdk] of [
   });
   assert.equal(await live.get("greet", { vars: { name: "Ada" } }), "Hi Ada", format);
 
+  const reports = [];
   const tested = new sdk.PromptHelm({
     apiKey: "ph_smoke",
-    fetch: async () =>
-      new Response(JSON.stringify({ ...payload, experiment }), {
+    fetch: async (url, init) => {
+      if (String(url).endsWith("/v1/reports")) {
+        reports.push(JSON.parse(init.body));
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify({ ...payload, experiment }), {
         headers: { "content-type": "application/json", etag: '"2"' },
-      }),
+      });
+    },
   });
   const control = await tested.resolve("greet", { vars: { name: "Ada" }, unit: "user-1" });
-  assert.deepEqual(control, { text: "Hi Ada", version: 1 }, format);
+  assert.equal(`${control.text} v${control.version}`, "Hi Ada v1", format);
   const variant = await tested.resolve("greet", { vars: { name: "Ada" }, unit: "user-0" });
-  assert.deepEqual(variant, { text: "Hey Ada", version: 2 }, format);
+  assert.equal(`${variant.text} v${variant.version}`, "Hey Ada v2", format);
+  variant.outcome(true);
+  variant.usage({ input_tokens: 12, output_tokens: 3 }, 120);
+  await tested.flush();
+  const counted = reports[0]?.experiments[0]?.versions[2];
+  assert.equal(`${counted?.served} ${counted?.outcomes} ${counted?.tokensIn}`, "1 1 12", format);
 
   const errors = [];
   const down = new sdk.PromptHelm({

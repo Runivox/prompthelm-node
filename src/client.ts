@@ -1,5 +1,5 @@
 import { PromptHelmError, type PromptHelmErrorCode } from "./errors";
-import { bucket } from "./experiment";
+import { bucket, LATENCY_BUCKETS, latencyBucket } from "./experiment";
 import { render, type Vars } from "./template";
 
 /** Not exported from the package: shared with the `pull` command. */
@@ -28,17 +28,40 @@ export interface PromptExperiment {
  */
 export const FALLBACK_HEADER = "x-prompthelm-fallback";
 
-/**
- * Sent with the next request for a slug while an experiment runs: how many times each version was
- * served, as `<experiment id>;<version>=<served>,<skipped>` for each version (`skipped`: picked
- * for the variant, served the live version because a variable wasn't passed). Counts only, never
- * any text, variable value or unit.
- */
-export const RESULTS_HEADER = "x-prompthelm-results";
-
 /** Body of `GET /v1/prompts`: every published prompt of the key's project, by slug. */
 export interface PromptListPayload {
   prompts: PromptPayload[];
+}
+
+/**
+ * Body of `POST /v1/reports`: what an app counted under running A/B tests since its last report.
+ * Numbers only, never any text, variable value or unit.
+ */
+export interface ReportPayload {
+  experiments: {
+    id: string;
+    /** The variant's share when these calls were assigned. */
+    weight: number;
+    /** By version number. */
+    versions: Record<string, ReportCounts>;
+  }[];
+}
+
+export interface ReportCounts {
+  served: number;
+  /** Picked for the variant, served the live version because a variable wasn't passed. */
+  skipped: number;
+  outcomes: number;
+  /** The outcomes' scores (true = 1, false = 0), summed, and their squares summed. */
+  scoreSum: number;
+  scoreSqSum: number;
+  /** Calls whose model usage was reported, their tokens and their durations in ms, summed. */
+  usage: number;
+  tokensIn: number;
+  tokensOut: number;
+  latencyMs: number;
+  /** Those calls per latency bucket (`latencyBucket`). */
+  latency: number[];
 }
 
 export interface PromptHelmOptions {
@@ -59,11 +82,13 @@ export interface PromptHelmOptions {
    */
   reportFallbacks?: boolean;
   /**
-   * Whether to tell PromptHelm, as counts only, how often each version of a prompt under an A/B
-   * test was served, so the prompt's page shows the variant reaching your app. Defaults to
+   * Whether to send PromptHelm, as totals only, what happened under an A/B test: how often each
+   * version was served, the outcomes and the model usage you report. Defaults to
    * `reportFallbacks`.
    */
   reportResults?: boolean;
+  /** Called on every `get` and `resolve`, so your analytics or traces can carry the version. */
+  onResolve?: (event: ResolveEvent) => void;
 }
 
 export interface GetOptions {
@@ -78,12 +103,36 @@ export interface GetOptions {
    * always gets the same version. Never sent to PromptHelm.
    */
   unit?: string | number;
+  /** During an A/B test, serves this side, such as the variant to your own team. Never counted. */
+  force?: "control" | "variant";
+}
+
+export interface ResolveEvent {
+  slug: string;
+  /** The version served, or null when the fallback was. */
+  version: number | null;
+  /** The A/B test running on the prompt, if any. */
+  experiment: string | null;
+  /** Whether the call got the test's variant. */
+  variant: boolean;
 }
 
 export interface Resolved {
   text: string;
   /** The version served, or null when the fallback was. */
   version: number | null;
+  /**
+   * During an A/B test, names the test and the version this call got, so its outcome can be
+   * reported later from any process: `ph.outcome(ticket, true)`. No user in it. Null otherwise.
+   */
+  ticket: string | null;
+  /** How the call went: true or false, or a score from 0 to 1. The first report counts. */
+  outcome(value: boolean | number): void;
+  /**
+   * The model call's tokens, from your provider's `usage` object, and how long it took: `ms`,
+   * else the time since `resolve` returned. The first report counts.
+   */
+  usage(usage: object | null | undefined, ms?: number): void;
 }
 
 interface Entry {
@@ -94,15 +143,37 @@ interface Entry {
   fetchedAt: number;
 }
 
-/**
- * One experiment's counts not yet sent: `[served, skipped]` for the live version (whose skipped
- * stays 0), then for the variant.
- */
-interface Results {
+/** An A/B test as its calls were assigned: under this share. */
+interface Test {
   id: string;
-  versions: [live: number, variant: number];
-  counts: number[];
+  weight: number;
 }
+
+// A version's counts are kept as numbers in this order, then one per latency bucket.
+const FIELDS = [
+  "served",
+  "skipped",
+  "outcomes",
+  "scoreSum",
+  "scoreSqSum",
+  "usage",
+  "tokensIn",
+  "tokensOut",
+  "latencyMs",
+] as const;
+const SERVED = 0;
+const SKIPPED = 1;
+const OUTCOMES = 2;
+const SCORE = 3;
+const SCORE_SQ = 4;
+const USAGE = 5;
+const TOKENS_IN = 6;
+const TOKENS_OUT = 7;
+const LATENCY = 8;
+const BUCKETS = FIELDS.length;
+
+/** Counts not yet sent, by test and share, then by version. */
+type Pending = Map<string, Test & { versions: Map<number, number[]> }>;
 
 export class PromptHelm {
   readonly #apiKey: string;
@@ -111,6 +182,7 @@ export class PromptHelm {
   readonly #timeout: number;
   readonly #fetch: typeof globalThis.fetch;
   readonly #onError: (error: PromptHelmError, slug: string) => void;
+  readonly #onResolve: ((event: ResolveEvent) => void) | undefined;
   readonly #cache = new Map<string, Entry>();
   readonly #inflight = new Map<string, Promise<Entry>>();
   readonly #reportFallbacks: boolean;
@@ -118,9 +190,8 @@ export class PromptHelm {
   // Per slug, why the live text last couldn't be served, until a request carries it. An object,
   // so a report made while that request is in flight isn't cleared with the one it carried.
   readonly #unreported = new Map<string, { code: PromptHelmErrorCode }>();
-  // Per slug, the running experiment's counts until a request carries them. A request takes them
-  // out and puts them back if it fails, so counts made while it is in flight are kept.
-  readonly #results = new Map<string, Results>();
+  #pending: Pending = new Map();
+  #timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: PromptHelmOptions = {}) {
     const apiKey = options.apiKey ?? env("PROMPTHELM_API_KEY");
@@ -133,6 +204,7 @@ export class PromptHelm {
     this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#onError =
       options.onError ?? ((error, slug) => console.warn(`[PromptHelm] ${slug}: ${error.message}`));
+    this.#onResolve = options.onResolve;
     this.#reportFallbacks = options.reportFallbacks ?? true;
     this.#reportResults = options.reportResults ?? this.#reportFallbacks;
   }
@@ -144,27 +216,87 @@ export class PromptHelm {
 
   /** Like `get`, and says which version was served, so you can tag your logs or traces with it. */
   async resolve(slug: string, options: GetOptions = {}): Promise<Resolved> {
-    const { vars, fallback, unit } = options;
+    const { vars, fallback } = options;
     try {
-      return this.#pick(slug, await this.#entry(slug), vars, unit);
+      return this.#pick(slug, await this.#entry(slug), options);
     } catch (error) {
       const failure = toPromptHelmError(error);
       this.#remember(slug, failure.code);
       if (fallback === undefined) throw failure;
       this.#onError(failure, slug);
-      return { text: render(fallback, vars), version: null };
+      return this.#served(slug, render(fallback, vars), null);
     }
   }
 
-  #pick(slug: string, entry: Entry, vars?: Vars, unit?: string | number): Resolved {
+  /** Reports the outcome of a call made earlier, by its `ticket`. Ignores anything else. */
+  outcome(ticket: string, value: boolean | number): void {
+    const [id = "", version, weight] = ticket.split(".");
+    const test = { id, weight: Number(weight) };
+    if (id && test.weight > 0) this.#outcome(test, Number(version), value);
+  }
+
+  /**
+   * Sends what was counted for A/B tests now, instead of within a ttl: call it before a
+   * serverless function freezes. Never throws; what can't be sent is kept for the next try.
+   */
+  async flush(): Promise<void> {
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
+    const sent = this.#pending;
+    if (sent.size === 0) return;
+    this.#pending = new Map();
+    const body: ReportPayload = {
+      experiments: [...sent.values()].map(({ id, weight, versions }) => ({
+        id,
+        weight,
+        versions: Object.fromEntries(
+          [...versions].map(([version, counts]) => [
+            version,
+            {
+              ...Object.fromEntries(FIELDS.map((field, i) => [field, counts[i]])),
+              latency: counts.slice(BUCKETS),
+            } as ReportCounts,
+          ]),
+        ),
+      })),
+    };
+    try {
+      const response = await this.#fetch(`${this.#baseUrl}/v1/reports`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.#apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.#timeout),
+      });
+      // Refused (a revoked key, a test that's gone) won't succeed later either.
+      if (response.status < 500) return;
+    } catch {
+      // Unreachable: kept below for the next try.
+    }
+    // Put back what didn't arrive, adding it to anything counted meanwhile.
+    for (const { id, weight, versions } of sent.values()) {
+      for (const [version, counts] of versions) {
+        const total = this.#counts({ id, weight }, version);
+        counts.forEach((n, i) => {
+          add(total, i, n);
+        });
+      }
+    }
+  }
+
+  #pick(slug: string, entry: Entry, options: GetOptions): Resolved {
+    const { vars, unit, force } = options;
     const { experiment } = entry;
+    // Calls forced to a side aren't part of the test, so they aren't counted.
+    const test =
+      experiment && !force ? { id: experiment.id, weight: experiment.weight } : undefined;
     let skipped: PromptHelmError | undefined;
-    if (experiment && bucket(experiment.id, unit) < experiment.weight) {
+    if (
+      experiment &&
+      (force ? force === "variant" : bucket(experiment.id, unit) < experiment.weight)
+    ) {
       const { version, content } = experiment.variant;
       try {
-        const text = render(content, vars);
-        this.#count(slug, entry, 2);
-        return { text, version };
+        return this.#served(slug, render(content, vars), version, experiment.id, test, true);
       } catch (error) {
         skipped = toPromptHelmError(error);
       }
@@ -172,39 +304,86 @@ export class PromptHelm {
     // The live version is what the app was built for. If it can't be filled in either, the
     // caller serves the fallback and reports that instead.
     const text = render(entry.content, vars);
-    if (skipped) {
+    if (skipped && experiment) {
       // Not a fallback, so not reported as one: the call got the live version.
       this.#onError(skipped, slug);
-      this.#count(slug, entry, 3);
+      if (test) add(this.#counts(test, experiment.variant.version), SKIPPED, 1);
     }
-    this.#count(slug, entry, 0);
-    return { text, version: entry.version };
+    return this.#served(slug, text, entry.version, experiment?.id, test);
   }
 
-  /** Adds one to a running experiment's count at `index` (see `Results`). */
-  #count(slug: string, { version, experiment }: Entry, index: number): void {
-    if (!experiment || !this.#reportResults) return;
-    let results = this.#results.get(slug);
-    if (results?.id !== experiment.id) {
-      // A new experiment: an ended one's unsent counts are dropped.
-      results = {
-        id: experiment.id,
-        versions: [version, experiment.variant.version],
-        counts: [0, 0, 0, 0],
-      };
-      this.#results.set(slug, results);
+  /** Counts the call, tells `onResolve`, and hands the caller its text and what to report. */
+  #served(
+    slug: string,
+    text: string,
+    version: number | null,
+    experiment?: string,
+    test?: Test,
+    variant = false,
+  ): Resolved {
+    if (test && version !== null) add(this.#counts(test, version), SERVED, 1);
+    try {
+      this.#onResolve?.({ slug, version, experiment: experiment ?? null, variant });
+    } catch {
+      // The app's own hook: its failure is never the call's.
     }
-    results.counts[index] = (results.counts[index] ?? 0) + 1;
+    const started = Date.now();
+    let reported = 0;
+    return {
+      text,
+      version,
+      ticket: test && version !== null ? `${test.id}.${version}.${test.weight}` : null,
+      outcome: (value) => {
+        if (!test || version === null || reported & 1) return;
+        reported |= 1;
+        this.#outcome(test, version, value);
+      },
+      usage: (usage, ms = Date.now() - started) => {
+        if (!test || version === null || reported & 2) return;
+        reported |= 2;
+        const counts = this.#counts(test, version);
+        const fields = (usage ?? {}) as Record<string, unknown>;
+        add(counts, USAGE, 1);
+        add(counts, TOKENS_IN, tokens(fields, IN));
+        add(counts, TOKENS_OUT, tokens(fields, OUT));
+        add(counts, LATENCY, Math.max(0, ms));
+        add(counts, BUCKETS + latencyBucket(ms), 1);
+      },
+    };
   }
 
-  /** Puts back the counts a failed request carried, adding any made meanwhile. */
-  #restore(slug: string, sent: Results): void {
-    const pending = this.#results.get(slug);
-    if (pending && pending.id !== sent.id) return;
-    pending?.counts.forEach((count, index) => {
-      sent.counts[index] = (sent.counts[index] ?? 0) + count;
-    });
-    this.#results.set(slug, sent);
+  #outcome(test: Test, version: number, value: boolean | number): void {
+    const score = value === true ? 1 : value === false ? 0 : value;
+    if (!Number.isInteger(version) || !(score >= 0 && score <= 1)) return;
+    const counts = this.#counts(test, version);
+    add(counts, OUTCOMES, 1);
+    add(counts, SCORE, score);
+    add(counts, SCORE_SQ, score * score);
+  }
+
+  /** The counts to add a call to, kept until the next report; none when reporting is off. */
+  #counts(test: Test, version: number): number[] | undefined {
+    if (!this.#reportResults) return;
+    const key = `${test.id}.${test.weight}`;
+    let pending = this.#pending.get(key);
+    if (!pending) {
+      pending = { ...test, versions: new Map() };
+      this.#pending.set(key, pending);
+    }
+    let counts = pending.versions.get(version);
+    if (!counts) {
+      counts = new Array<number>(BUCKETS + LATENCY_BUCKETS).fill(0);
+      pending.versions.set(version, counts);
+    }
+    this.#schedule();
+    return counts;
+  }
+
+  /** Reports within a ttl of the first count, without keeping the process alive for it. */
+  #schedule(): void {
+    if (this.#timer) return;
+    this.#timer = setTimeout(() => this.flush(), this.#ttl);
+    (this.#timer as { unref?: () => void }).unref?.();
   }
 
   #entry(slug: string): Promise<Entry> {
@@ -245,13 +424,6 @@ export class PromptHelm {
     if (cached?.etag) headers["if-none-match"] = cached.etag;
     const report = this.#unreported.get(slug);
     if (report) headers[FALLBACK_HEADER] = report.code;
-    const results = this.#results.get(slug);
-    if (results) {
-      this.#results.delete(slug);
-      const { id, versions, counts } = results;
-      headers[RESULTS_HEADER] =
-        `${id};${versions[0]}=${counts.slice(0, 2).join(",")};${versions[1]}=${counts.slice(2).join(",")}`;
-    }
 
     let response: Response;
     try {
@@ -260,7 +432,6 @@ export class PromptHelm {
         signal: AbortSignal.timeout(this.#timeout),
       });
     } catch (error) {
-      if (results) this.#restore(slug, results);
       if ((error as { name?: unknown } | null)?.name === "TimeoutError") {
         throw new PromptHelmError("timeout", `No response within ${this.#timeout} ms`);
       }
@@ -281,10 +452,7 @@ export class PromptHelm {
       this.#cache.set(slug, entry);
       return entry;
     }
-    if (!response.ok) {
-      if (results) this.#restore(slug, results);
-      throw await errorFromResponse(response);
-    }
+    if (!response.ok) throw await errorFromResponse(response);
 
     const payload = (await response.json()) as PromptPayload;
     const entry = {
@@ -297,6 +465,23 @@ export class PromptHelm {
     this.#cache.set(slug, entry);
     return entry;
   }
+}
+
+// Where the major providers' `usage` objects keep their tokens: OpenAI's Responses and
+// Anthropic, OpenAI's Chat Completions, the Vercel AI SDK (5 and later) and Gemini.
+const IN = ["input_tokens", "prompt_tokens", "inputTokens", "promptTokenCount"];
+const OUT = ["output_tokens", "completion_tokens", "outputTokens", "candidatesTokenCount"];
+
+function tokens(usage: Record<string, unknown>, keys: string[]): number {
+  for (const key of keys) {
+    const value = usage[key];
+    if (typeof value === "number" && value >= 0 && Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function add(counts: number[] | undefined, index: number, amount: number): void {
+  if (counts) counts[index] = (counts[index] ?? 0) + amount;
 }
 
 export async function errorFromResponse(response: Response): Promise<PromptHelmError> {
