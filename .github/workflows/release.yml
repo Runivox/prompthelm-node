@@ -1,0 +1,32 @@
+# Publishes to npm when a version tag (v1.2.3) is pushed. npm trusts this workflow by its file name
+# (trusted publishing, OIDC), so it needs no token and adds provenance on its own. Renaming this
+# file breaks publishing until the trusted publisher on npmjs.com is changed to match.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # Trusted publishing needs Node 22.14 and npm 11.5.1 or later.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          # Never a cache in a release build.
+          package-manager-cache: false
+      - run: npm install -g npm@^11.5.1
+      - name: Check that the tag matches package.json
+        run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+      - run: npm ci
+      # prepublishOnly runs the typecheck, the tests and the build first.
+      - run: npm publish

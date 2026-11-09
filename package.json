@@ -1,0 +1,69 @@
+{
+  "name": "@prompt-helm/sdk",
+  "version": "1.2.0",
+  "description": "Fetch your PromptHelm prompts at runtime, so changing a prompt needs no redeploy.",
+  "homepage": "https://prompthelm.app/quickstart",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Runivox/prompthelm-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Runivox/prompthelm-node/issues"
+  },
+  "keywords": [
+    "prompt",
+    "prompt-management",
+    "llm",
+    "prompts",
+    "versioning",
+    "rollback",
+    "openai",
+    "anthropic",
+    "sdk"
+  ],
+  "license": "MIT",
+  "author": "Runivox Ltd (https://prompthelm.app)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "bin": {
+    "prompthelm": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check",
+    "format": "biome format --write",
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.2",
+    "@types/node": "^22",
+    "tsup": "^9.0.0",
+    "typescript": "~6.0.3",
+    "vitest": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
