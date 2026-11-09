@@ -1,6 +1,6 @@
 {
   "name": "@prompt-helm/sdk",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Fetch your PromptHelm prompts at runtime, so changing a prompt needs no redeploy.",
   "homepage": "https://prompthelm.app/quickstart",
   "repository": {
