@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 live version of a prompt at runtime (`ph.get("support-reply", { vars, fallback })`), so changing a
 prompt in the dashboard needs no rebuild and no redeploy. During an A/B test (Pro), the SDK picks
 the live version or the variant for each call (`unit` keeps a user on one); `ph.resolve()` says
-which version it served and takes the call's outcome and model usage, which the SDK sends to
-PromptHelm as totals. The package also ships `npx @prompt-helm/sdk pull`, which
+which version it served, with that version's model settings (`config`: `model`, `temperature`,
+`maxTokens`, only those set in the dashboard; empty for a fallback), and takes the call's outcome
+and model usage, which the SDK sends to PromptHelm as totals. The package also ships `npx @prompt-helm/sdk pull`, which
 writes every published prompt to a fallbacks file.
 
 This repository is the SDK's only home since 2026-11-09, when it moved out of the service's
@@ -47,7 +48,8 @@ npx vitest run test/client.test.ts -t "fallback"
   in serves the live version and counts as `skipped`, never as a fallback. Forced calls (`force`)
   are never counted.
 - **The service imports this package.** PromptHelm's server types its responses with
-  `PromptPayload` (with its optional `experiment`, a `PromptExperiment`) and
+  `PromptPayload` (with its optional `config`, a `PromptConfig`, and `experiment`, a
+  `PromptExperiment`, whose variant has its own `config`) and
   `PromptListPayload`, reads `ReportPayload` (and `latencyBucket` for its buckets), extracts
   variables with `extractVariables`, reads `FALLBACK_HEADER`, and stores only a value in
   `ERROR_CODES`. Together they are the wire contract: change it here first and release, then the
@@ -59,11 +61,12 @@ npx vitest run test/client.test.ts -t "fallback"
   independently. Counts are kept per test and per share (`weight`), so a changed share never
   mixes them; a ticket is `<experiment id>.<version>.<weight>`, nothing about the user.
 - **`pull` never reaches the library.** It lives in `src/pull.ts` and builds to `dist/cli.js`
-  (the package's `bin`, Node only); `src/index.ts` must not import it, so an app's bundle stays
-  under 3 kB. That figure, stated in the README and on prompthelm.app, is minified and gzipped, as
-  bundlephobia and an app's bundler count it (1.2.0: 1.4 kB ESM, 1.6 kB CJS; 1.3.0, with A/B
-  tests, outcomes and usage: 2,742 B ESM, 2,958 B CJS, so little room is left). Measure both after
-  a change:
+  (the package's `bin`, Node only); `src/index.ts` must not import it, so it never weighs on an
+  app's bundle. Neither the README nor prompthelm.app states a size any more (owner's call,
+  2026-11-10, when model settings came in; "under 3 kB" from 1.3.0, "under 2 kB" before), but
+  keep it small. Minified and gzipped, as bundlephobia and an app's bundler count it: 1.3.0 was
+  2,742 B ESM, 2,958 B CJS; 1.4.0, with model settings, 2,770 B ESM, 2,988 B CJS. Measure both
+  after a change:
   `npx esbuild src/index.ts --bundle --minify --format=esm --platform=neutral | gzip -9 | wc -c`
   (and `--format=cjs`). The unminified `dist` keeps JSDoc on class members, so keep long notes
   there as `//` comments. tsup builds the two in parallel, so the library's `clean` spares

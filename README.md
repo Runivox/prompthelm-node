@@ -14,7 +14,9 @@ refresh, 60 seconds by default.
   a refresh that finds nothing new is an empty `304`.
 - **Your data stays with you.** Variables are filled in on your server. PromptHelm never sees
   their values, your provider keys or your LLM traffic.
-- **Small.** No dependencies, under 3 kB gzipped, ESM and CommonJS, Node.js 18 and later.
+- **Model settings travel with the text.** A version can carry its model, temperature and
+  output limit, so moving to a cheaper model is a publish you can roll back or A/B test.
+- **No dependencies.** ESM and CommonJS, Node.js 18 and later.
 
 ## Install
 
@@ -108,6 +110,32 @@ Run it in CI before the build, so every deploy carries the text that was live th
 `PROMPTHELM_API_KEY` (and `PROMPTHELM_BASE_URL`), and writes JSON for a `.json` path or with
 `--format json`. A prompt appears in the file once it's published.
 
+## Model settings
+
+A version can carry the model to call it with, its temperature and its output limit, set next to
+the text in the dashboard. Moving to a cheaper model is then a publish like any other: one click
+rolls it back, and an A/B test can tell whether it does as well. `resolve` hands them over with
+the text:
+
+```ts
+const r = await ph.resolve("support-reply", {
+  vars: { company: "Acme", customer_name: user.name },
+  fallback: SUPPORT_REPLY,
+});
+
+const reply = await openai.responses.create({
+  model: r.config.model ?? "gpt-5",
+  temperature: r.config.temperature,
+  max_output_tokens: r.config.maxTokens,
+  input: r.text,
+});
+```
+
+`config` holds only the settings set in the dashboard (`model`, `temperature`, `maxTokens`), so
+keep your defaults in the code; when the fallback is served it is empty. PromptHelm doesn't check
+a model name with your provider, and a name your provider doesn't know fails your calls: try a new
+model in an A/B test first. Apps on SDK versions before 1.4 ignore the settings.
+
 ## A/B tests
 
 On the Pro plan, a prompt's page can run an experiment: the live version keeps most calls and a
@@ -123,14 +151,15 @@ const r = await ph.resolve("support-reply", {
   unit: user.id,
 });
 
-const reply = await openai.responses.create({ model: "gpt-5", input: r.text });
+const reply = await openai.responses.create({ model: r.config.model ?? "gpt-5", input: r.text });
 r.usage(reply.usage); // tokens, and how long the call took since resolve
 r.outcome(userKeptTheReply); // true or false, or a score from 0 to 1
 ```
 
 The prompt's page then compares the two versions: how often each succeeded, with a range that
 stays honest however often you look, and their tokens and latency per call. It says when there's
-an answer; shipping the variant stays your call.
+an answer; shipping the variant stays your call. Each version brings its own
+[model settings](#model-settings), so a test can compare two models as well as two texts.
 
 - **Outcomes that come later.** A purchase days later, in another service: keep `r.ticket` with
   your own record, then call `ph.outcome(ticket, true)` from any process. The ticket names the
@@ -156,7 +185,7 @@ share only moves units from the live version to the variant, never back. Apps on
 before 1.3 ignore experiments and serve the live version to every call.
 
 To split calls the same way from another language: during an experiment the response carries
-`experiment: { id, weight, variant: { version, content, variables } }`. A unit's bucket is the
+`experiment: { id, weight, variant: { version, content, variables, config } }`. A unit's bucket is the
 32-bit FNV-1a hash of the UTF-8 bytes of `<experiment id>:<unit>`, modulo 100; buckets below
 `weight` get the variant.
 
@@ -169,8 +198,9 @@ curl https://prompthelm.app/v1/prompts/support-reply \
   -H "Authorization: Bearer $PROMPTHELM_API_KEY"
 ```
 
-`GET /v1/prompts` returns every published prompt of the key's project at once, as
-`{ "prompts": [ … ] }`.
+The response carries the live version's `content`, its `variables` and its model settings as
+`config` (only the ones set). `GET /v1/prompts` returns every published prompt of the key's
+project at once, as `{ "prompts": [ … ] }`.
 
 ## Links
 

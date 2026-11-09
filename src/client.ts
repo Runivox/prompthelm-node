@@ -11,15 +11,27 @@ export interface PromptPayload {
   version: number;
   content: string;
   variables: string[];
+  /** The version's model settings; servers before SDK 1.4 send none. */
+  config?: PromptConfig;
   /** An A/B test running on the prompt: the live version above is its control. */
   experiment?: PromptExperiment;
+}
+
+/**
+ * Model settings published with a version, for your model call. Only the ones set in the
+ * dashboard are present; for the rest, your code's defaults apply.
+ */
+export interface PromptConfig {
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
 }
 
 export interface PromptExperiment {
   id: string;
   /** The variant's share of calls, in percent (1–99). */
   weight: number;
-  variant: { version: number; content: string; variables: string[] };
+  variant: { version: number; content: string; variables: string[]; config?: PromptConfig };
 }
 
 /**
@@ -119,6 +131,11 @@ export interface ResolveEvent {
 
 export interface Resolved {
   text: string;
+  /**
+   * The served version's model settings, such as `model`. Empty when the fallback was served,
+   * so your code's defaults apply.
+   */
+  config: PromptConfig;
   /** The version served, or null when the fallback was. */
   version: number | null;
   /**
@@ -138,6 +155,7 @@ export interface Resolved {
 interface Entry {
   version: number;
   content: string;
+  config: PromptConfig;
   experiment: PromptExperiment | undefined;
   etag: string | null;
   fetchedAt: number;
@@ -224,7 +242,7 @@ export class PromptHelm {
       this.#remember(slug, failure.code);
       if (fallback === undefined) throw failure;
       this.#onError(failure, slug);
-      return this.#served(slug, render(fallback, vars), null);
+      return this.#served(slug, render(fallback, vars), {}, null);
     }
   }
 
@@ -294,9 +312,17 @@ export class PromptHelm {
       experiment &&
       (force ? force === "variant" : bucket(experiment.id, unit) < experiment.weight)
     ) {
-      const { version, content } = experiment.variant;
+      const { version, content, config = {} } = experiment.variant;
       try {
-        return this.#served(slug, render(content, vars), version, experiment.id, test, true);
+        return this.#served(
+          slug,
+          render(content, vars),
+          config,
+          version,
+          experiment.id,
+          test,
+          true,
+        );
       } catch (error) {
         skipped = toPromptHelmError(error);
       }
@@ -309,13 +335,14 @@ export class PromptHelm {
       this.#onError(skipped, slug);
       if (test) add(this.#counts(test, experiment.variant.version), SKIPPED, 1);
     }
-    return this.#served(slug, text, entry.version, experiment?.id, test);
+    return this.#served(slug, text, entry.config, entry.version, experiment?.id, test);
   }
 
-  /** Counts the call, tells `onResolve`, and hands the caller its text and what to report. */
+  /** Counts the call, tells `onResolve`, and hands the caller its text, settings and what to report. */
   #served(
     slug: string,
     text: string,
+    config: PromptConfig,
     version: number | null,
     experiment?: string,
     test?: Test,
@@ -331,6 +358,8 @@ export class PromptHelm {
     let reported = 0;
     return {
       text,
+      // A copy: the cached one serves every later call.
+      config: { ...config },
       version,
       ticket: test && version !== null ? `${test.id}.${version}.${test.weight}` : null,
       outcome: (value) => {
@@ -458,6 +487,7 @@ export class PromptHelm {
     const entry = {
       version: payload.version,
       content: payload.content,
+      config: payload.config ?? {},
       experiment: payload.experiment,
       etag: response.headers.get("etag"),
       fetchedAt: Date.now(),

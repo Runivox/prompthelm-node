@@ -1,6 +1,7 @@
 export {
   FALLBACK_HEADER,
   type GetOptions,
+  type PromptConfig,
   type PromptExperiment,
   PromptHelm,
   type PromptHelmOptions,
