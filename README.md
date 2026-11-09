@@ -60,7 +60,8 @@ All optional when the environment variables are set.
 | `timeout` | `3000`                                            | How long, in ms, one request may take.                               |
 | `onError` | `console.warn`                                    | Called with the error and the slug when a fallback or a cached prompt was served instead of failing. |
 | `reportFallbacks` | `true`                                  | Tells PromptHelm, by error code only, when a fallback or a cached prompt was served, so the prompt's page shows which app fell back and why. |
-| `reportResults` | `reportFallbacks`                           | During an [A/B test](#ab-tests), tells PromptHelm how many times each version was served, as counts only. |
+| `reportResults` | `reportFallbacks`                           | During an [A/B test](#ab-tests), sends PromptHelm totals only: calls served per version, and the outcomes and usage you report. |
+| `onResolve` | none                                              | Called on every `get` and `resolve` with the version served, for your analytics or traces. |
 | `fetch`   | global `fetch`                                    | Your own fetch, for tests or a proxy.                                |
 
 ## Errors
@@ -112,31 +113,47 @@ Run it in CI before the build, so every deploy carries the text that was live th
 On the Pro plan, a prompt's page can run an experiment: the live version keeps most calls and a
 variant gets the share you pick. The SDK picks the version for each call on your server. Pass a
 `unit`, such as a user or conversation id, and that unit gets the same version every time;
-without one, each call is picked at random. `resolve` returns the text with the version it
-served, so you can tag your logs or traces with it and compare the two:
+without one, each call is picked at random. Use `resolve` to learn which version a call got, and
+tell PromptHelm how it went:
 
 ```ts
-const { text, version } = await ph.resolve("support-reply", {
+const r = await ph.resolve("support-reply", {
   vars: { company: "Acme", customer_name: user.name },
   fallback: SUPPORT_REPLY,
   unit: user.id,
 });
 
-// With OpenTelemetry, or however you log your model calls. `version` is null for the fallback.
-span.setAttribute("prompthelm.version", version ?? "fallback");
+const reply = await openai.responses.create({ model: "gpt-5", input: r.text });
+r.usage(reply.usage); // tokens, and how long the call took since resolve
+r.outcome(userKeptTheReply); // true or false, or a score from 0 to 1
 ```
+
+The prompt's page then compares the two versions: how often each succeeded, with a range that
+stays honest however often you look, and their tokens and latency per call. It says when there's
+an answer; shipping the variant stays your call.
+
+- **Outcomes that come later.** A purchase days later, in another service: keep `r.ticket` with
+  your own record, then call `ph.outcome(ticket, true)` from any process. The ticket names the
+  test and the version, not the user.
+- **Your own analytics.** `onResolve` is called on every `get` and `resolve` with the slug, the
+  version, the test and whether the call got the variant, so your events or traces can carry it:
+  `new PromptHelm({ onResolve: (e) => posthog.capture("prompt_served", e) })`.
+- **Your team first.** `force: "variant"` (or `"control"`) serves that side to a call, such as
+  to your own staff. Forced calls are never counted.
+- **Serverless.** Counts are sent within a ttl. A function that freezes after its response
+  should `await ph.flush()` first (with `waitUntil`, where the platform has it).
+- **Usage objects** from OpenAI (Responses and Chat Completions), Anthropic, the Vercel AI SDK
+  and Gemini are read as they are. `r.usage(null, ms)` reports a duration alone.
+
+Only totals reach PromptHelm: how many calls each version served, the outcomes, tokens and
+durations you report. Never the text, a variable's value or the unit. Counts a process holds
+when it exits are lost, so read them as a sample. `reportResults: false` sends none; unless you
+set it, it follows `reportFallbacks`.
 
 If the variant uses a variable the call doesn't pass, that call gets the live version and
 `onError` receives `missing_variables`; it isn't reported as a fallback. Growing the variant's
-share only moves units from the live version to the variant, never back.
-
-While an experiment runs, the next request for its slug carries how many times each version was
-served (`x-prompthelm-results`), so the prompt's page shows the variant reaching your app. Only
-counts are sent, never the text, a variable's value or the unit. Counts a process holds when it
-exits are lost, so read them as a sample. `reportResults: false` sends none; unless you set it,
-it follows `reportFallbacks`.
-
-Apps on SDK versions before 1.3 ignore experiments and serve the live version to every call.
+share only moves units from the live version to the variant, never back. Apps on SDK versions
+before 1.3 ignore experiments and serve the live version to every call.
 
 To split calls the same way from another language: during an experiment the response carries
 `experiment: { id, weight, variant: { version, content, variables } }`. A unit's bucket is the

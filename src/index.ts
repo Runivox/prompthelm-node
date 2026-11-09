@@ -6,8 +6,11 @@ export {
   type PromptHelmOptions,
   type PromptListPayload,
   type PromptPayload,
-  RESULTS_HEADER,
+  type ReportCounts,
+  type ReportPayload,
   type Resolved,
+  type ResolveEvent,
 } from "./client";
 export { ERROR_CODES, PromptHelmError, type PromptHelmErrorCode } from "./errors";
+export { LATENCY_BUCKETS, latencyBucket } from "./experiment";
 export { extractVariables, render, type Vars } from "./template";

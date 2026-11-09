@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   FALLBACK_HEADER,
+  LATENCY_BUCKETS,
+  latencyBucket,
   type PromptExperiment,
   PromptHelm,
   PromptHelmError,
-  RESULTS_HEADER,
+  type ReportPayload,
+  type ResolveEvent,
 } from "../src";
 import { bucket, fnv1a32 } from "../src/experiment";
 
@@ -16,6 +19,8 @@ function fakeApi() {
   let live = { version: 1, content: "Hello {{name}}" };
   let experiment: PromptExperiment | undefined;
   let down = false;
+  let reportStatus = 204;
+  const reports: ReportPayload[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const headers = init?.headers as Record<string, string>;
     if (down) throw new TypeError("fetch failed");
@@ -24,6 +29,10 @@ function fakeApi() {
         { error: { code: "unauthorized", message: "Invalid API key" } },
         { status: 401 },
       );
+    }
+    if (String(input).endsWith("/v1/reports")) {
+      if (reportStatus < 300) reports.push(JSON.parse(String(init?.body)) as ReportPayload);
+      return new Response(null, { status: reportStatus });
     }
     if (!String(input).endsWith("/v1/prompts/greeting")) {
       return Response.json(
@@ -44,6 +53,12 @@ function fakeApi() {
   });
   return {
     fetch,
+    /** The reports PromptHelm accepted, in order. */
+    reports,
+    /** How PromptHelm answers a report: 204, or an error status. */
+    answerReports(status: number) {
+      reportStatus = status;
+    },
     publish(content: string) {
       live = { version: live.version + 1, content };
     },
@@ -304,19 +319,9 @@ describe("reporting fallbacks", () => {
 describe("A/B tests", () => {
   const units = Array.from({ length: 10_000 }, (_, i) => `user-${i}`);
   const onVariant = (unit: string, weight = 20) => bucket("exp-1", unit) < weight;
-  /** The counts a request should carry for calls with these units, under exp-1 at 20%. */
-  const counted = (calls: string[]) => {
-    const variant = calls.filter((unit) => onVariant(unit)).length;
-    return `exp-1;1=${calls.length - variant},0;2=${variant},0`;
-  };
-  /** The results header each request carried, in order. */
-  const results = (api: ReturnType<typeof fakeApi>) =>
-    api.fetch.mock.calls.map(
-      ([, init]) => (init?.headers as Record<string, string>)[RESULTS_HEADER] ?? null,
-    );
   const client = (
     api: ReturnType<typeof fakeApi>,
-    options: { reportFallbacks?: boolean; reportResults?: boolean; onError?: () => void } = {},
+    options: ConstructorParameters<typeof PromptHelm>[0] = {},
   ) =>
     new PromptHelm({
       apiKey: KEY,
@@ -326,6 +331,17 @@ describe("A/B tests", () => {
       onError: () => {},
       ...options,
     });
+  /** One field of what PromptHelm received for a version, summed over every report. */
+  const received = (
+    api: ReturnType<typeof fakeApi>,
+    version: number,
+    field: Exclude<keyof ReportPayload["experiments"][number]["versions"][string], "latency">,
+    { id = "exp-1", weight = 20 } = {},
+  ) =>
+    api.reports
+      .flatMap((report) => report.experiments)
+      .filter((experiment) => experiment.id === id && experiment.weight === weight)
+      .reduce((sum, experiment) => sum + (experiment.versions[version]?.[field] ?? 0), 0);
   /** One call, its background refresh settled, then the ttl passes. */
   const call = async (ph: PromptHelm, unit: string) => {
     await ph.get("greeting", { vars: { name: "x" }, unit });
@@ -351,15 +367,27 @@ describe("A/B tests", () => {
     expect(bucket("9b2e7c1e-8d4f-4a57-9b0e-3f1d2c4a5b6c", 42)).toBe(66);
   });
 
-  it("serves the live version and sends no counts when nothing is being tested", async () => {
+  it("files durations in latency buckets that end at 50·2^(i/2) ms", () => {
+    expect(latencyBucket(0)).toBe(0);
+    expect(latencyBucket(49.9)).toBe(0);
+    for (let i = 1; i < LATENCY_BUCKETS; i++) {
+      const upTo = 50 * 2 ** (i / 2);
+      expect(latencyBucket(upTo * 0.999)).toBe(i);
+      if (i < LATENCY_BUCKETS - 1) expect(latencyBucket(upTo * 1.001)).toBe(i + 1);
+    }
+    expect(latencyBucket(10 ** 9)).toBe(LATENCY_BUCKETS - 1);
+  });
+
+  it("serves the live version and reports nothing when nothing is being tested", async () => {
     const api = fakeApi();
     const ph = client(api);
-    await expect(
-      ph.resolve("greeting", { vars: { name: "Ayşe" }, unit: "user-1" }),
-    ).resolves.toEqual({ text: "Hello Ayşe", version: 1 });
-    vi.advanceTimersByTime(TTL);
-    await call(ph, "user-1");
-    expect(results(api)).toEqual([null, null]);
+    const resolved = await ph.resolve("greeting", { vars: { name: "Ayşe" }, unit: "user-1" });
+    expect(resolved).toMatchObject({ text: "Hello Ayşe", version: 1, ticket: null });
+    resolved.outcome(true);
+    resolved.usage({ input_tokens: 10 });
+    await ph.flush();
+    expect(api.reports).toEqual([]);
+    expect(api.fetch).toHaveBeenCalledTimes(1);
   });
 
   it("gives a unit the same version every time, and the variant about its share", async () => {
@@ -379,8 +407,12 @@ describe("A/B tests", () => {
     for (let i = 0; i < 3; i++) {
       await expect(
         ph.resolve("greeting", { vars: { name: "x" }, unit: "user-1" }),
-      ).resolves.toEqual({ text: "Hello x", version: 1 });
+      ).resolves.toMatchObject({ text: "Hello x", version: 1 });
     }
+
+    await ph.flush();
+    expect(received(api, 1, "served") + received(api, 2, "served")).toBe(units.length + 3);
+    expect(received(api, 2, "served")).toBe(variant);
   });
 
   it("moves units only from the live version to the variant when its share grows", async () => {
@@ -408,6 +440,21 @@ describe("A/B tests", () => {
     expect(onB(after)).toBeGreaterThan(onB(before));
   });
 
+  it("counts calls under each share apart, so a changed share doesn't mix them", async () => {
+    const api = fakeApi();
+    api.experiment({ weight: 20, content: "Hi {{name}}" });
+    const ph = client(api);
+    await call(ph, "user-1");
+    api.experiment({ weight: 30, content: "Hi {{name}}" });
+    await call(ph, "user-2"); // still served under 20%; its refresh brings 30%
+    await call(ph, "user-3");
+    await ph.flush();
+
+    const at = (weight: number) =>
+      received(api, 1, "served", { weight }) + received(api, 2, "served", { weight });
+    expect([at(20), at(30)]).toEqual([2, 1]);
+  });
+
   it("serves the live version, not the fallback, when the variant needs a variable the call doesn't pass", async () => {
     const api = fakeApi();
     api.experiment({ weight: 99, content: "Hi {{name}} from {{city}}" });
@@ -416,7 +463,7 @@ describe("A/B tests", () => {
 
     await expect(
       ph.resolve("greeting", { vars: { name: "Ayşe" }, unit: "user-1", fallback: "Hey" }),
-    ).resolves.toEqual({ text: "Hello Ayşe", version: 1 });
+    ).resolves.toMatchObject({ text: "Hello Ayşe", version: 1 });
     expect(onError).toHaveBeenCalledWith(
       expect.objectContaining({ code: "missing_variables" }),
       "greeting",
@@ -426,7 +473,10 @@ describe("A/B tests", () => {
     await call(ph, "user-1");
     const refresh = api.fetch.mock.calls[1]?.[1]?.headers as Record<string, string>;
     expect(refresh[FALLBACK_HEADER]).toBeUndefined(); // the app got its prompt: no fallback
-    expect(refresh[RESULTS_HEADER]).toBe("exp-1;1=1,0;2=0,1");
+    await ph.flush();
+    const at = { weight: 99 };
+    expect([received(api, 1, "served", at), received(api, 2, "skipped", at)]).toEqual([2, 2]);
+    expect(received(api, 2, "served", at)).toBe(0);
   });
 
   it("serves the fallback when the live version can't be filled in either", async () => {
@@ -435,73 +485,189 @@ describe("A/B tests", () => {
     api.experiment({ weight: 99, content: "Hi {{name}} in {{city}}" });
     const ph = client(api);
 
-    await expect(
-      ph.resolve("greeting", { vars: { name: "Ayşe" }, unit: "user-1", fallback: "Hey {{name}}" }),
-    ).resolves.toEqual({ text: "Hey Ayşe", version: null });
+    const resolved = await ph.resolve("greeting", {
+      vars: { name: "Ayşe" },
+      unit: "user-1",
+      fallback: "Hey {{name}}",
+    });
+    expect(resolved).toMatchObject({ text: "Hey Ayşe", version: null, ticket: null });
     vi.advanceTimersByTime(TTL);
     await ph.get("greeting", { vars: { name: "Ayşe" }, unit: "user-1", fallback: "Hey" });
     await settle();
+    await ph.flush();
 
     const refresh = api.fetch.mock.calls[1]?.[1]?.headers as Record<string, string>;
     expect(refresh[FALLBACK_HEADER]).toBe("missing_variables");
-    expect(refresh[RESULTS_HEADER]).toBeUndefined();
+    expect(api.reports).toEqual([]);
   });
 
-  it("sends the counts with the next request for the slug, once", async () => {
+  it("reports what it counted within a ttl, once, without keeping the process alive", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const api = fakeApi();
     api.experiment({ weight: 20, content: "Hi {{name}}" });
     const ph = client(api);
-    const batch = units.slice(0, 50);
-    for (const unit of batch) await ph.get("greeting", { vars: { name: "x" }, unit });
-    vi.advanceTimersByTime(TTL);
+    for (const unit of units.slice(0, 50)) await ph.get("greeting", { vars: { name: "x" }, unit });
+    expect(api.reports).toHaveLength(0);
 
-    await call(ph, "user-0"); // its refresh carries the 50; its own count waits for the next
-    await call(ph, "user-0");
-    expect(results(api)).toEqual([null, counted(batch), counted(["user-0"])]);
+    await vi.advanceTimersByTimeAsync(TTL);
+    expect(api.reports).toHaveLength(1);
+    expect(received(api, 1, "served") + received(api, 2, "served")).toBe(50);
+    await vi.advanceTimersByTimeAsync(TTL * 3);
+    expect(api.reports).toHaveLength(1);
   });
 
-  it("keeps the counts when the request carrying them fails", async () => {
+  it("keeps what a failed report carried and sends it with the next; drops what's refused", async () => {
     const api = fakeApi();
     api.experiment({ weight: 20, content: "Hi {{name}}" });
     const ph = client(api);
+    const served = () => received(api, 1, "served") + received(api, 2, "served");
 
-    await call(ph, "user-1");
+    await ph.get("greeting", { vars: { name: "x" }, unit: "user-1" });
     api.setDown(true);
-    await call(ph, "user-2"); // its refresh fails with user-1's count
+    await ph.flush(); // unreachable
     api.setDown(false);
-    await call(ph, "user-3");
-    expect(results(api)).toEqual([null, counted(["user-1"]), counted(["user-1", "user-2"])]);
+    api.answerReports(503);
+    await ph.get("greeting", { vars: { name: "x" }, unit: "user-2" });
+    await ph.flush(); // a server error
+    api.answerReports(204);
+    await ph.get("greeting", { vars: { name: "x" }, unit: "user-3" });
+    await ph.flush();
+    expect(served()).toBe(3);
+
+    api.answerReports(400);
+    await ph.get("greeting", { vars: { name: "x" }, unit: "user-4" });
+    await ph.flush(); // refused: it wouldn't succeed later either
+    api.answerReports(204);
+    await ph.flush();
+    expect(served()).toBe(3);
   });
 
-  it("drops an ended experiment's unsent counts once another one is served", async () => {
+  it("reports outcomes as scores, once per call, and ignores what isn't one", async () => {
+    const api = fakeApi();
+    api.experiment({ weight: 1, content: "Hi {{name}}" });
+    const ph = client(api);
+    const live = () => ph.resolve("greeting", { vars: { name: "x" }, unit: "user-1" });
+
+    const first = await live();
+    first.outcome(true);
+    first.outcome(false); // the first report counts
+    (await live()).outcome(0.25);
+    (await live()).outcome(2);
+    (await live()).outcome(Number.NaN);
+    (await live()).outcome(false);
+    await ph.flush();
+
+    const at = { weight: 1 };
+    expect(received(api, 1, "outcomes", at)).toBe(3);
+    expect(received(api, 1, "scoreSum", at)).toBe(1.25);
+    expect(received(api, 1, "scoreSqSum", at)).toBe(1.0625);
+  });
+
+  it("reads tokens from the major providers' usage objects and times the call", async () => {
+    const api = fakeApi();
+    api.experiment({ weight: 1, content: "Hi {{name}}" });
+    const ph = client(api);
+    const live = () => ph.resolve("greeting", { vars: { name: "x" }, unit: "user-1" });
+
+    (await live()).usage({ prompt_tokens: 10, completion_tokens: 5 }, 40); // OpenAI Chat Completions
+    (await live()).usage({ input_tokens: 7, output_tokens: 3 }, 100); // OpenAI Responses, Anthropic
+    (await live()).usage({ inputTokens: 2, outputTokens: 1 }, 100); // Vercel AI SDK
+    (await live()).usage({ promptTokenCount: 4, candidatesTokenCount: 6 }, 1_000); // Gemini
+    const timed = await live();
+    vi.advanceTimersByTime(250);
+    timed.usage(undefined); // no tokens; timed since resolve
+    timed.usage({ input_tokens: 99 }, 1); // the first report counts
+    await ph.flush();
+
+    const at = { weight: 1 };
+    expect(received(api, 1, "usage", at)).toBe(5);
+    expect(received(api, 1, "tokensIn", at)).toBe(23);
+    expect(received(api, 1, "tokensOut", at)).toBe(15);
+    expect(received(api, 1, "latencyMs", at)).toBe(1_490);
+    const latency = api.reports[0]?.experiments[0]?.versions[1]?.latency ?? [];
+    expect(latency).toHaveLength(LATENCY_BUCKETS);
+    expect(latency[latencyBucket(40)]).toBe(1);
+    expect(latency[latencyBucket(100)]).toBe(2);
+    expect(latency[latencyBucket(250)]).toBe(1);
+    expect(latency[latencyBucket(1_000)]).toBe(1);
+  });
+
+  it("takes an outcome later, from any process, by the call's ticket", async () => {
+    const api = fakeApi();
+    api.experiment({ weight: 20, content: "Hi {{name}}" });
+    const resolved = await client(api).resolve("greeting", { vars: { name: "x" }, unit: "user-1" });
+    expect(resolved.ticket).toBe("exp-1.1.20");
+
+    const worker = client(api); // say, the process that handles the order days later
+    worker.outcome(resolved.ticket ?? "", true);
+    for (const ticket of ["nonsense", "exp-1.x.20", "exp-1.1.0", ".1.20"]) {
+      worker.outcome(ticket, true);
+    }
+    await worker.flush();
+    expect(received(api, 1, "outcomes")).toBe(1);
+    expect(api.reports).toHaveLength(1);
+  });
+
+  it("serves a forced side without counting it, and tells onResolve which side every call got", async () => {
+    const api = fakeApi();
+    api.experiment({ weight: 20, content: "Hi {{name}}" });
+    const events: ResolveEvent[] = [];
+    const ph = client(api, { onResolve: (event) => events.push(event) });
+
+    const team = await ph.resolve("greeting", { vars: { name: "x" }, force: "variant" });
+    expect(team).toMatchObject({ text: "Hi x", version: 2, ticket: null });
+    team.outcome(true);
+    team.usage({ input_tokens: 5 });
+    await expect(
+      ph.resolve("greeting", { vars: { name: "x" }, unit: "user-0", force: "control" }),
+    ).resolves.toMatchObject({ version: 1 });
+    await ph.flush();
+    expect(api.reports).toEqual([]);
+
+    await ph.resolve("greeting", { vars: { name: "x" }, unit: "user-0" }); // bucket 14: variant
+    expect(events).toEqual([
+      { slug: "greeting", version: 2, experiment: "exp-1", variant: true },
+      { slug: "greeting", version: 1, experiment: "exp-1", variant: false },
+      { slug: "greeting", version: 2, experiment: "exp-1", variant: true },
+    ]);
+  });
+
+  it("never lets a failing onResolve fail the call", async () => {
+    const api = fakeApi();
+    const ph = client(api, {
+      onResolve: () => {
+        throw new Error("analytics down");
+      },
+    });
+    await expect(ph.get("greeting", { vars: { name: "x" } })).resolves.toBe("Hello x");
+  });
+
+  it("keeps an ended test's counts until they're sent", async () => {
     const api = fakeApi();
     api.experiment({ weight: 20, content: "Hi {{name}}" });
     const ph = client(api);
-
     await call(ph, "user-1");
     api.experiment({ id: "exp-2", weight: 20, content: "Hi {{name}}" });
-    // Its refresh carries user-1 and brings exp-2; user-2 itself is counted for exp-1.
-    await ph.get("greeting", { vars: { name: "x" }, unit: "user-2" });
-    await settle();
-    // Within the ttl, under exp-2: user-2's unsent count is dropped.
-    await ph.get("greeting", { vars: { name: "x" }, unit: "user-3" });
-    vi.advanceTimersByTime(TTL);
-    await call(ph, "user-4");
+    await call(ph, "user-2"); // still exp-1; its refresh brings exp-2
+    await call(ph, "user-3");
+    await ph.flush();
 
-    const exp2 = bucket("exp-2", "user-3") < 20 ? "1=0,0;2=1,0" : "1=1,0;2=0,0";
-    expect(results(api)).toEqual([null, counted(["user-1"]), `exp-2;${exp2}`]);
+    const tested = (id: string) =>
+      received(api, 1, "served", { id }) + received(api, 2, "served", { id });
+    expect([tested("exp-1"), tested("exp-2")]).toEqual([2, 1]);
   });
 
   it.each([
     [{ reportResults: false }, false],
     [{ reportFallbacks: false }, false],
     [{ reportFallbacks: false, reportResults: true }, true],
-  ])("with %o, sends counts: %s", async (options, sends) => {
+  ])("with %o, reports: %s", async (options, sends) => {
     const api = fakeApi();
     api.experiment({ weight: 20, content: "Hi {{name}}" });
     const ph = client(api, options);
-    await call(ph, "user-1");
-    await call(ph, "user-1");
-    expect(results(api)).toEqual([null, sends ? counted(["user-1"]) : null]);
+    const resolved = await ph.resolve("greeting", { vars: { name: "x" }, unit: "user-1" });
+    resolved.outcome(true);
+    await ph.flush();
+    expect(api.reports.length > 0).toBe(sends);
   });
 });

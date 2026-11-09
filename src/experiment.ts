@@ -15,3 +15,13 @@ export function bucket(experimentId: string, unit?: string | number): number {
     ? Math.floor(Math.random() * 100)
     : fnv1a32(`${experimentId}:${unit}`) % 100;
 }
+
+export const LATENCY_BUCKETS = 24;
+
+/**
+ * Which of 24 latency buckets a model call's duration falls in, for its percentiles: bucket i
+ * holds calls up to 50·2^(i/2) ms (bucket 0 under 50 ms), and the last one everything slower.
+ */
+export function latencyBucket(ms: number): number {
+  return ms < 50 ? 0 : Math.min(LATENCY_BUCKETS - 1, 1 + Math.floor(2 * Math.log2(ms / 50)));
+}
