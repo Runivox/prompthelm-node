@@ -7,6 +7,12 @@ import * as esm from "../dist/index.js";
 
 const cjs = createRequire(import.meta.url)("../dist/index.cjs");
 const payload = { slug: "greet", version: 1, content: "Hi {{name}}", variables: ["name"] };
+// In exp-1, user-0 falls in bucket 14 and user-1 in 33: a 20% test serves user-0 the variant.
+const experiment = {
+  id: "exp-1",
+  weight: 20,
+  variant: { version: 2, content: "Hey {{name}}", variables: ["name"] },
+};
 
 for (const [format, sdk] of [
   ["ESM", esm],
@@ -20,6 +26,18 @@ for (const [format, sdk] of [
       }),
   });
   assert.equal(await live.get("greet", { vars: { name: "Ada" } }), "Hi Ada", format);
+
+  const tested = new sdk.PromptHelm({
+    apiKey: "ph_smoke",
+    fetch: async () =>
+      new Response(JSON.stringify({ ...payload, experiment }), {
+        headers: { "content-type": "application/json", etag: '"2"' },
+      }),
+  });
+  const control = await tested.resolve("greet", { vars: { name: "Ada" }, unit: "user-1" });
+  assert.deepEqual(control, { text: "Hi Ada", version: 1 }, format);
+  const variant = await tested.resolve("greet", { vars: { name: "Ada" }, unit: "user-0" });
+  assert.deepEqual(variant, { text: "Hey Ada", version: 2 }, format);
 
   const errors = [];
   const down = new sdk.PromptHelm({
