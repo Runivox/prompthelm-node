@@ -91,7 +91,12 @@ export async function fetchLivePrompts(options: {
 /** The file's text: sorted by slug, so a refresh only shows in a diff when a prompt changed. */
 export function renderFallbacks(prompts: readonly PromptPayload[], format: FallbackFormat): string {
   const sorted = [...prompts].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  const json = JSON.stringify(Object.fromEntries(sorted.map((p) => [p.slug, p.content])), null, 2);
+  // A prompt with a user message gets both, in the shape `get` and `resolve` take as a fallback.
+  const entries = sorted.map((p) => [
+    p.slug,
+    p.user ? { system: p.content, user: p.user.content } : p.content,
+  ]);
+  const json = JSON.stringify(Object.fromEntries(entries), null, 2);
   return format === "json"
     ? `${json}\n`
     : `${TS_HEADER}export const fallbacks = ${json} as const;\n`;

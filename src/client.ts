@@ -9,12 +9,22 @@ export const DEFAULT_BASE_URL = "https://prompthelm.app";
 export interface PromptPayload {
   slug: string;
   version: number;
+  /** The system message: every SDK serves it, and SDKs before 1.5 serve nothing else. */
   content: string;
+  /** The variables `content` uses. */
   variables: string[];
+  /** The user message, when the version has one; servers before SDK 1.5 send none. */
+  user?: PromptMessage;
   /** The version's model settings; servers before SDK 1.4 send none. */
   config?: PromptConfig;
   /** An A/B test running on the prompt: the live version above is its control. */
   experiment?: PromptExperiment;
+}
+
+/** A message besides the system one, with the variables it uses. */
+export interface PromptMessage {
+  content: string;
+  variables: string[];
 }
 
 /**
@@ -25,13 +35,39 @@ export interface PromptConfig {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  /** How the model must answer; absent when it answers in text. Servers before SDK 1.5 send none. */
+  response?: PromptResponse;
+}
+
+/**
+ * An answer in JSON that matches `schema`: a JSON Schema (2020-12) kept inside what OpenAI,
+ * Anthropic, Gemini and Bedrock all accept. Hand it to your provider's structured output.
+ */
+export interface PromptResponse {
+  type: "json";
+  /** A name for the schema, made from the prompt's slug; OpenAI and Bedrock ask for one. */
+  name: string;
+  schema: { [key: string]: unknown };
 }
 
 export interface PromptExperiment {
   id: string;
   /** The variant's share of calls, in percent (1–99). */
   weight: number;
-  variant: { version: number; content: string; variables: string[]; config?: PromptConfig };
+  variant: {
+    version: number;
+    content: string;
+    variables: string[];
+    user?: PromptMessage;
+    config?: PromptConfig;
+  };
+}
+
+/** A fallback with both messages, for a prompt that has a user message. */
+export interface PromptFallback {
+  system: string;
+  /** Left out: `user` is null when the fallback is served. */
+  user?: string;
 }
 
 /**
@@ -107,9 +143,10 @@ export interface GetOptions {
   vars?: Vars;
   /**
    * Served when PromptHelm can't be reached, the prompt doesn't exist, or the live
-   * version uses a variable this call doesn't pass. Without it those cases throw.
+   * version uses a variable this call doesn't pass. Without it those cases throw. A string is
+   * the system message; `{ system, user }` gives both, filled in like the live version.
    */
-  fallback?: string;
+  fallback?: string | PromptFallback;
   /**
    * Who the call is for, such as a user or conversation id: during an A/B test the same unit
    * always gets the same version. Never sent to PromptHelm.
@@ -130,7 +167,12 @@ export interface ResolveEvent {
 }
 
 export interface Resolved {
+  /** The system message, filled in: what `get` returns. */
   text: string;
+  /** The same as `text`, named after the message it is. */
+  system: string;
+  /** The user message, filled in; null when the version has none, so your app sends its own. */
+  user: string | null;
   /**
    * The served version's model settings, such as `model`. Empty when the fallback was served,
    * so your code's defaults apply.
@@ -155,6 +197,7 @@ export interface Resolved {
 interface Entry {
   version: number;
   content: string;
+  user: PromptMessage | undefined;
   config: PromptConfig;
   experiment: PromptExperiment | undefined;
   etag: string | null;
@@ -193,6 +236,26 @@ const BUCKETS = FIELDS.length;
 /** Counts not yet sent, by test and share, then by version. */
 type Pending = Map<string, Test & { versions: Map<number, number[]> }>;
 
+/** The messages a call gets, filled in. */
+interface Messages {
+  system: string;
+  user: string | null;
+}
+
+/** Fills the messages in; the user one only for a caller that reads it (`resolve`, not `get`). */
+function fill(
+  system: string,
+  user: PromptMessage | string | undefined,
+  vars: Vars | undefined,
+  withUser: boolean,
+): Messages {
+  const text = typeof user === "string" ? user : user?.content;
+  return {
+    system: render(system, vars),
+    user: withUser && text !== undefined ? render(text, vars) : null,
+  };
+}
+
 export class PromptHelm {
   readonly #apiKey: string;
   readonly #baseUrl: string;
@@ -227,22 +290,33 @@ export class PromptHelm {
     this.#reportResults = options.reportResults ?? this.#reportFallbacks;
   }
 
-  /** The live version of a prompt with its variables filled in. */
+  /**
+   * The live version's system message with its variables filled in. It never needs the user
+   * message's variables: an app that calls `get` sends its own.
+   */
   async get(slug: string, options: GetOptions = {}): Promise<string> {
-    return (await this.resolve(slug, options)).text;
+    return (await this.#resolve(slug, options, false)).text;
   }
 
-  /** Like `get`, and says which version was served, so you can tag your logs or traces with it. */
-  async resolve(slug: string, options: GetOptions = {}): Promise<Resolved> {
+  /**
+   * Like `get`, with the user message too, the model settings, and which version was served, so
+   * you can tag your logs or traces with it.
+   */
+  resolve(slug: string, options: GetOptions = {}): Promise<Resolved> {
+    return this.#resolve(slug, options, true);
+  }
+
+  async #resolve(slug: string, options: GetOptions, withUser: boolean): Promise<Resolved> {
     const { vars, fallback } = options;
     try {
-      return this.#pick(slug, await this.#entry(slug), options);
+      return this.#pick(slug, await this.#entry(slug), options, withUser);
     } catch (error) {
       const failure = toPromptHelmError(error);
       this.#remember(slug, failure.code);
       if (fallback === undefined) throw failure;
       this.#onError(failure, slug);
-      return this.#served(slug, render(fallback, vars), {}, null);
+      const own = typeof fallback === "string" ? { system: fallback } : fallback;
+      return this.#served(slug, fill(own.system, own.user, vars, withUser), {}, null);
     }
   }
 
@@ -301,7 +375,7 @@ export class PromptHelm {
     }
   }
 
-  #pick(slug: string, entry: Entry, options: GetOptions): Resolved {
+  #pick(slug: string, entry: Entry, options: GetOptions, withUser: boolean): Resolved {
     const { vars, unit, force } = options;
     const { experiment } = entry;
     // Calls forced to a side aren't part of the test, so they aren't counted.
@@ -312,11 +386,11 @@ export class PromptHelm {
       experiment &&
       (force ? force === "variant" : bucket(experiment.id, unit) < experiment.weight)
     ) {
-      const { version, content, config = {} } = experiment.variant;
+      const { version, content, user, config = {} } = experiment.variant;
       try {
         return this.#served(
           slug,
-          render(content, vars),
+          fill(content, user, vars, withUser),
           config,
           version,
           experiment.id,
@@ -329,19 +403,19 @@ export class PromptHelm {
     }
     // The live version is what the app was built for. If it can't be filled in either, the
     // caller serves the fallback and reports that instead.
-    const text = render(entry.content, vars);
+    const messages = fill(entry.content, entry.user, vars, withUser);
     if (skipped && experiment) {
       // Not a fallback, so not reported as one: the call got the live version.
       this.#onError(skipped, slug);
       if (test) add(this.#counts(test, experiment.variant.version), SKIPPED, 1);
     }
-    return this.#served(slug, text, entry.config, entry.version, experiment?.id, test);
+    return this.#served(slug, messages, entry.config, entry.version, experiment?.id, test);
   }
 
-  /** Counts the call, tells `onResolve`, and hands the caller its text, settings and what to report. */
+  /** Counts the call, tells `onResolve`, and hands the caller its messages, settings and what to report. */
   #served(
     slug: string,
-    text: string,
+    { system, user }: Messages,
     config: PromptConfig,
     version: number | null,
     experiment?: string,
@@ -357,9 +431,11 @@ export class PromptHelm {
     const started = Date.now();
     let reported = 0;
     return {
-      text,
-      // A copy: the cached one serves every later call.
-      config: { ...config },
+      text: system,
+      system,
+      user,
+      // A copy, schema and all: the cached one serves every later call.
+      config: structuredClone(config),
       version,
       ticket: test && version !== null ? `${test.id}.${version}.${test.weight}` : null,
       outcome: (value) => {
@@ -487,6 +563,7 @@ export class PromptHelm {
     const entry = {
       version: payload.version,
       content: payload.content,
+      user: payload.user,
       config: payload.config ?? {},
       experiment: payload.experiment,
       etag: response.headers.get("etag"),
