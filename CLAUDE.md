@@ -8,8 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 live version of a prompt at runtime (`ph.get("support-reply", { vars, fallback })`), so changing a
 prompt in the dashboard needs no rebuild and no redeploy. During an A/B test (Pro), the SDK picks
 the live version or the variant for each call (`unit` keeps a user on one); `ph.resolve()` says
-which version it served, with that version's model settings (`config`: `model`, `temperature`,
-`maxTokens`, only those set in the dashboard; empty for a fallback), and takes the call's outcome
+which version it served, with its system and user messages (`system`, and `user` when the
+version has one; `get` returns the system message alone and never needs the user message's
+variables) and that version's model settings (`config`: `model`, `temperature`, `maxTokens` and,
+from 1.5, `response`, a JSON Schema for the answer; only those set in the dashboard; empty for a
+fallback), and takes the call's outcome
 and model usage, which the SDK sends to PromptHelm as totals. The package also ships `npx @prompt-helm/sdk pull`, which
 writes every published prompt to a fallbacks file.
 
@@ -47,9 +50,12 @@ npx vitest run test/client.test.ts -t "fallback"
   can't be reached or answers 5xx, and dropped when it refuses them. A variant the call can't fill
   in serves the live version and counts as `skipped`, never as a fallback. Forced calls (`force`)
   are never counted.
+- **`content` stays the system message.** SDKs before 1.5 serve it alone, so a server must never
+  move a version's system text out of it; the user message is the additive `user`.
 - **The service imports this package.** PromptHelm's server types its responses with
-  `PromptPayload` (with its optional `config`, a `PromptConfig`, and `experiment`, a
-  `PromptExperiment`, whose variant has its own `config`) and
+  `PromptPayload` (with its optional `user`, a `PromptMessage`; `config`, a `PromptConfig` with
+  an optional `response`; and `experiment`, a `PromptExperiment`, whose variant has its own `user`
+  and `config`) and
   `PromptListPayload`, reads `ReportPayload` (and `latencyBucket` for its buckets), extracts
   variables with `extractVariables`, reads `FALLBACK_HEADER`, and stores only a value in
   `ERROR_CODES`. Together they are the wire contract: change it here first and release, then the
@@ -65,7 +71,8 @@ npx vitest run test/client.test.ts -t "fallback"
   app's bundle. Neither the README nor prompthelm.app states a size any more (owner's call,
   2026-11-10, when model settings came in; "under 3 kB" from 1.3.0, "under 2 kB" before), but
   keep it small. Minified and gzipped, as bundlephobia and an app's bundler count it: 1.3.0 was
-  2,742 B ESM, 2,958 B CJS; 1.4.0, with model settings, 2,770 B ESM, 2,988 B CJS. Measure both
+  2,742 B ESM, 2,958 B CJS; 1.4.0, with model settings, 2,770 B ESM, 2,988 B CJS; 1.5.0, with
+  the user message and the response format, 2,895 B ESM, 3,110 B CJS. Measure both
   after a change:
   `npx esbuild src/index.ts --bundle --minify --format=esm --platform=neutral | gzip -9 | wc -c`
   (and `--format=cjs`). The unminified `dist` keeps JSDoc on class members, so keep long notes

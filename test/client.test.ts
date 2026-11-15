@@ -17,7 +17,7 @@ const TTL = 60_000;
 
 /** Stands in for the API: one prompt, "greeting", with ETag support. */
 function fakeApi() {
-  let live: { version: number; content: string; config?: PromptConfig } = {
+  let live: { version: number; content: string; user?: string; config?: PromptConfig } = {
     version: 1,
     content: "Hello {{name}}",
   };
@@ -56,7 +56,8 @@ function fakeApi() {
         version: live.version,
         content: live.content,
         variables: [],
-        // Left out when unset, as a server before 1.4 does.
+        // Left out when unset, as a server before 1.5 does (and before 1.4 for config).
+        ...(live.user !== undefined && { user: { content: live.user, variables: [] } }),
         ...(live.config && { config: live.config }),
         experiment,
       },
@@ -71,12 +72,19 @@ function fakeApi() {
     answerReports(status: number) {
       reportStatus = status;
     },
-    publish(content: string, config?: PromptConfig) {
-      live = { version: live.version + 1, content, ...(config && { config }) };
+    publish(content: string, config?: PromptConfig, user?: string) {
+      live = {
+        version: live.version + 1,
+        content,
+        ...(config && { config }),
+        ...(user !== undefined && { user }),
+      };
     },
     /** Runs an A/B test with `content` as the next version, or ends it. */
     experiment(
-      test: { id?: string; weight: number; content: string; config?: PromptConfig } | undefined,
+      test:
+        | { id?: string; weight: number; content: string; user?: string; config?: PromptConfig }
+        | undefined,
     ) {
       experiment = test && {
         id: test.id ?? "exp-1",
@@ -85,6 +93,7 @@ function fakeApi() {
           version: live.version + 1,
           content: test.content,
           variables: [],
+          ...(test.user !== undefined && { user: { content: test.user, variables: [] } }),
           ...(test.config && { config: test.config }),
         },
       };
@@ -258,6 +267,24 @@ describe("model settings", () => {
     );
   });
 
+  it("carry the response format, and a caller's changes to its schema don't reach the cache", async () => {
+    const api = fakeApi();
+    const schema = {
+      type: "object",
+      properties: { reply: { type: "string" } },
+      required: ["reply"],
+      additionalProperties: false,
+    };
+    api.publish("Hi {{name}}", { response: { type: "json", name: "greeting", schema } });
+    const ph = client(api);
+
+    const r = await ph.resolve("greeting", { vars: { name: "a" } });
+    expect(r.config.response).toEqual({ type: "json", name: "greeting", schema });
+    (r.config.response?.schema as { required: string[] }).required.push("changed");
+    const again = await ph.resolve("greeting", { vars: { name: "a" } });
+    expect(again.config.response?.schema).toEqual(schema);
+  });
+
   it("are empty from a server that sends none, and when the fallback is served", async () => {
     const api = fakeApi();
     expect((await client(api).resolve("greeting", { vars: { name: "Ayşe" } })).config).toEqual({});
@@ -281,6 +308,66 @@ describe("model settings", () => {
     api.experiment({ weight: 99, content: "Hey {{name}} in {{city}}", config: { model: "x" } });
     const skipped = await client(api).resolve("greeting", { vars: { name: "a" }, unit: "user-1" });
     expect(skipped).toMatchObject({ text: "Hi a", config: { model: "gpt-5" } });
+  });
+});
+
+describe("system and user messages", () => {
+  const client = (api: ReturnType<typeof fakeApi>) =>
+    new PromptHelm({
+      apiKey: KEY,
+      baseUrl: "https://ph.test",
+      fetch: api.fetch,
+      onError: () => {},
+    });
+
+  it("resolve fills both in; get serves the system message without the user one's variables", async () => {
+    const api = fakeApi();
+    api.publish("Hi {{name}}", undefined, "Customer wrote: {{message}}");
+    const ph = client(api);
+
+    const r = await ph.resolve("greeting", { vars: { name: "Ayşe", message: "Where is it?" } });
+    expect(r).toMatchObject({
+      text: "Hi Ayşe",
+      system: "Hi Ayşe",
+      user: "Customer wrote: Where is it?",
+    });
+    // An app on `get` sends its own user message, so it never needs that message's variables.
+    expect(await ph.get("greeting", { vars: { name: "Ayşe" } })).toBe("Hi Ayşe");
+  });
+
+  it("has no user message when the version has none", async () => {
+    const r = await client(fakeApi()).resolve("greeting", { vars: { name: "a" } });
+    expect(r).toMatchObject({ system: "Hello a", user: null });
+  });
+
+  it("falls back when the user message can't be filled in, with both messages from the fallback", async () => {
+    const api = fakeApi();
+    api.publish("Hi {{name}}", undefined, "Customer wrote: {{message}}");
+
+    const both = await client(api).resolve("greeting", {
+      vars: { name: "a" },
+      fallback: { system: "Hello {{name}}", user: "Help" },
+    });
+    expect(both).toMatchObject({ system: "Hello a", user: "Help", version: null });
+    const one = await client(api).resolve("greeting", { vars: { name: "a" }, fallback: "Hello" });
+    expect(one).toMatchObject({ text: "Hello", user: null });
+    expect(await client(api).get("greeting", { fallback: { system: "Hello", user: "Help" } })).toBe(
+      "Hello",
+    );
+  });
+
+  it("follow an A/B test's side, and the live version when the variant's user message can't be filled in", async () => {
+    const api = fakeApi();
+    api.publish("Hi {{name}}", undefined, "Q: {{message}}");
+    api.experiment({ weight: 99, content: "Hey {{name}}", user: "Question: {{message}}" });
+    const vars = { name: "a", message: "m" };
+
+    const variant = await client(api).resolve("greeting", { vars, force: "variant" });
+    expect(variant).toMatchObject({ system: "Hey a", user: "Question: m" });
+
+    api.experiment({ weight: 99, content: "Hey {{name}}", user: "Question: {{message}} {{city}}" });
+    const skipped = await client(api).resolve("greeting", { vars, unit: "user-1" });
+    expect(skipped).toMatchObject({ system: "Hi a", user: "Q: m" });
   });
 });
 

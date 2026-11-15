@@ -16,6 +16,8 @@ refresh, 60 seconds by default.
   their values, your provider keys or your LLM traffic.
 - **Model settings travel with the text.** A version can carry its model, temperature and
   output limit, so moving to a cheaper model is a publish you can roll back or A/B test.
+- **System and user messages.** A prompt can hold the user message too, with its own variables,
+  and ask for an answer in JSON that matches a schema.
 - **No dependencies.** ESM and CommonJS, Node.js 18 and later.
 
 ## Install
@@ -49,6 +51,30 @@ const system = await ph.get("support-reply", {
 The stored prompt marks each variable in double braces, such as `{{customer_name}}`. If the live
 version uses a variable the call doesn't pass, `get` doesn't send a half-filled prompt: it
 returns the fallback (or, without one, throws `missing_variables`).
+
+## System and user messages
+
+A prompt's text is its system message. It can also hold the user message, for a request your app
+sends the same way each time with different values. `resolve` fills both in:
+
+```ts
+const r = await ph.resolve("classify-ticket", {
+  vars: { product: "Acme", ticket: ticket.text },
+  fallback: { system: CLASSIFY_TICKET, user: "Ticket: {{ticket}}" },
+});
+
+const reply = await openai.responses.create({
+  model: r.config.model ?? "gpt-5",
+  instructions: r.system,
+  input: r.user ?? ticket.text,
+});
+```
+
+`user` is `null` when the live version has none: your app sends its own, such as what the person
+typed. `get` returns the system message only and never needs the user message's variables, so an
+app that sends its own user message keeps working when one is added in the dashboard. If the user
+message uses a variable the call doesn't pass, `resolve` returns the fallback, as it does for the
+system message. SDK versions before 1.5 receive the system message only.
 
 ## Options
 
@@ -106,6 +132,8 @@ const system = await ph.get("support-reply", {
 });
 ```
 
+A prompt with a user message is written as `{ system, user }`, the shape `fallback` takes.
+
 Run it in CI before the build, so every deploy carries the text that was live then. It reads
 `PROMPTHELM_API_KEY` (and `PROMPTHELM_BASE_URL`), and writes JSON for a `.json` path or with
 `--format json`. A prompt appears in the file once it's published.
@@ -131,10 +159,38 @@ const reply = await openai.responses.create({
 });
 ```
 
-`config` holds only the settings set in the dashboard (`model`, `temperature`, `maxTokens`), so
-keep your defaults in the code; when the fallback is served it is empty. PromptHelm doesn't check
-a model name with your provider, and a name your provider doesn't know fails your calls: try a new
-model in an A/B test first. Apps on SDK versions before 1.4 ignore the settings.
+`config` holds only the settings set in the dashboard (`model`, `temperature`, `maxTokens`,
+`response`), so keep your defaults in the code; when the fallback is served it is empty.
+PromptHelm doesn't check a model name with your provider, and a name your provider doesn't know
+fails your calls: try a new model in an A/B test first. Apps on SDK versions before 1.4 ignore the
+settings.
+
+### Answers in JSON
+
+A version can ask for an answer in JSON with the fields set in the dashboard. `config.response` is
+then `{ type: "json", name, schema }`: a JSON Schema kept inside what OpenAI, Anthropic, Gemini and
+Amazon Bedrock all accept, so the same schema works with each. Hand it to your provider's
+structured output:
+
+```ts
+const { response } = r.config;
+const reply = await openai.responses.create({
+  model: r.config.model ?? "gpt-5",
+  instructions: r.system,
+  input: r.user ?? ticket.text,
+  ...(response && {
+    text: {
+      format: { type: "json_schema", name: response.name, schema: response.schema, strict: true },
+    },
+  }),
+});
+```
+
+On Anthropic's API the schema goes in `output_config: { format: { type: "json_schema", schema } }`,
+on Gemini in `responseJsonSchema` with `responseMimeType: "application/json"`, and on Bedrock's
+Converse in `outputConfig.textFormat` (as a string). PromptHelm never sees the answer, so check it
+in your code. Without a response format the model answers in text; SDK versions before 1.5 ignore
+it.
 
 ## A/B tests
 

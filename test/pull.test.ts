@@ -68,6 +68,24 @@ describe("the fallbacks file", () => {
     expect(text.endsWith("}\n")).toBe(true);
   });
 
+  it("writes both messages for a prompt with a user message, as a fallback takes them", () => {
+    const text = renderFallbacks(
+      [
+        {
+          slug: "classify",
+          version: 3,
+          content: "Sort the ticket.",
+          variables: [],
+          user: { content: "Ticket: {{text}}", variables: ["text"] },
+        },
+      ],
+      "json",
+    );
+    expect(JSON.parse(text)).toEqual({
+      classify: { system: "Sort the ticket.", user: "Ticket: {{text}}" },
+    });
+  });
+
   it("writes TypeScript with typed keys", () => {
     const text = renderFallbacks(PROMPTS, "ts");
     expect(text).toContain("export const fallbacks = {");
