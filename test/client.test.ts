@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  API_HEADER,
   FALLBACK_HEADER,
   LATENCY_BUCKETS,
   latencyBucket,
@@ -826,5 +827,131 @@ describe("A/B tests", () => {
     resolved.outcome(true);
     await ph.flush();
     expect(api.reports.length > 0).toBe(sends);
+  });
+});
+
+describe("the app's API", () => {
+  let api: ReturnType<typeof fakeApi>;
+  beforeEach(() => {
+    api = fakeApi();
+  });
+
+  it("serves a version for the call's API, and the fallback for another one, saying why", async () => {
+    api.publish("Hi {{name}}", {
+      model: "claude-sonnet-5-5",
+      apis: ["anthropic-messages", "chat-completions"],
+    });
+    const errors: string[] = [];
+    const ph = new PromptHelm({
+      apiKey: KEY,
+      fetch: api.fetch,
+      onError: (error) => errors.push(error.code),
+    });
+    const fits = await ph.resolve("greeting", {
+      vars: { name: "Ada" },
+      api: "anthropic-messages",
+      fallback: "Hello",
+    });
+    expect(fits).toMatchObject({ version: 2, api: "anthropic-messages" });
+    // Any API the model takes there is served.
+    expect(
+      (await ph.resolve("greeting", { vars: { name: "Ada" }, api: "chat-completions" })).version,
+    ).toBe(2);
+    expect((api.fetch.mock.calls[0]?.[1]?.headers as Record<string, string>)[API_HEADER]).toBe(
+      "anthropic-messages",
+    );
+    const other = await ph.resolve("greeting", {
+      vars: { name: "Ada" },
+      api: "openai-responses",
+      fallback: "Hello",
+    });
+    expect(other).toMatchObject({ version: null, system: "Hello", config: {} });
+    expect(errors).toEqual(["api_mismatch"]);
+    // A version the catalog couldn't place, or a call that names no API, is served as before.
+    expect((await ph.resolve("greeting", { vars: { name: "Ada" } })).version).toBe(2);
+  });
+
+  it("skips a test's variant for another API, serving the live version", async () => {
+    api.publish("Hi", { apis: ["anthropic-messages"] });
+    api.experiment({ weight: 99, content: "Hey", config: { apis: ["openai-responses"] } });
+    const ph = new PromptHelm({ apiKey: KEY, fetch: api.fetch, onError: () => {} });
+    const unit =
+      Array.from({ length: 200 }, (_, i) => `u${i}`).find((u) => bucket("exp-1", u) < 99) ?? "u0";
+    const r = await ph.resolve("greeting", { unit, api: "anthropic-messages" });
+    expect(r.version).toBe(2);
+    await ph.flush();
+    expect(api.reports[0]?.experiments[0]?.versions["3"]?.skipped).toBe(1);
+  });
+});
+
+describe("Resolved.failed", () => {
+  let api: ReturnType<typeof fakeApi>;
+  beforeEach(() => {
+    api = fakeApi();
+  });
+
+  const openai = Object.assign(new Error("400 temperature: secret customer words"), {
+    status: 400,
+    type: "invalid_request_error",
+    code: "unsupported_value",
+    param: "temperature",
+  });
+  const aws = Object.assign(new Error("Malformed input: secret customer words"), {
+    name: "ValidationException",
+    $metadata: { httpStatusCode: 400 },
+  });
+
+  it("reports a refused call by its status and codes, never its message", async () => {
+    const ph = new PromptHelm({ apiKey: KEY, fetch: api.fetch });
+    const first = await ph.resolve("greeting", { vars: { name: "Ada" } });
+    first.failed(openai);
+    first.failed(openai); // the first report counts
+    (await ph.resolve("greeting", { vars: { name: "Ada" } })).failed(openai);
+    (await ph.resolve("greeting", { vars: { name: "Ada" } })).failed(aws);
+    (await ph.resolve("greeting", { vars: { name: "Ada" } })).failed(new TypeError("fetch failed"));
+    (await ph.resolve("greeting", { vars: { name: "Ada" } })).failed({
+      status: 429,
+      type: "a sentence with spaces",
+    });
+    await ph.flush();
+    expect(api.reports).toHaveLength(1);
+    expect(api.reports[0]?.experiments).toEqual([]);
+    expect(api.reports[0]?.failures).toEqual([
+      {
+        slug: "greeting",
+        version: 1,
+        status: 400,
+        type: "invalid_request_error",
+        code: "unsupported_value",
+        param: "temperature",
+        count: 2,
+      },
+      { slug: "greeting", version: 1, status: 400, type: "ValidationException", count: 1 },
+      { slug: "greeting", version: 1, status: 429, count: 1 },
+    ]);
+    expect(JSON.stringify(api.reports)).not.toContain("secret");
+  });
+
+  it("keeps them for the next try when PromptHelm can't take them, and sends none when off", async () => {
+    const ph = new PromptHelm({ apiKey: KEY, fetch: api.fetch });
+    (await ph.resolve("greeting", { vars: { name: "Ada" } })).failed(openai);
+    api.answerReports(503);
+    await ph.flush();
+    api.answerReports(204);
+    (await ph.resolve("greeting", { vars: { name: "Ada" } })).failed(openai);
+    await ph.flush();
+    expect(api.reports[0]?.failures?.[0]?.count).toBe(2);
+
+    const quiet = new PromptHelm({ apiKey: KEY, fetch: api.fetch, reportFailures: false });
+    (await quiet.resolve("greeting", { vars: { name: "Ada" } })).failed(openai);
+    // A fallback has no version to blame.
+    const fallback = await new PromptHelm({
+      apiKey: "ph_wrong",
+      fetch: api.fetch,
+      onError: () => {},
+    }).resolve("greeting", { fallback: "Hello" });
+    fallback.failed(openai);
+    await quiet.flush();
+    expect(api.reports).toHaveLength(1);
   });
 });

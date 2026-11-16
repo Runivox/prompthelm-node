@@ -6,6 +6,8 @@ export const ERROR_CODES = [
   "timeout",
   "network",
   "server",
+  // The version is for another API than the one the call asked for (`api`, SDK 1.6).
+  "api_mismatch",
 ] as const;
 
 export type PromptHelmErrorCode = (typeof ERROR_CODES)[number];
