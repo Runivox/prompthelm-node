@@ -27,9 +27,27 @@ export interface PromptMessage {
   variables: string[];
 }
 
+/** The APIs a version can be called with, as `config.apis` and the `api` option name them. */
+export const PROMPT_APIS = [
+  "openai-responses",
+  "chat-completions",
+  "anthropic-messages",
+  "gemini",
+  "bedrock-converse",
+] as const;
+
+export type PromptApi = (typeof PROMPT_APIS)[number];
+
+/**
+ * Sent with each request for a slug a call asked for with `api`: the API the app calls the model
+ * with, so the prompt's page can warn before publishing a version for another one.
+ */
+export const API_HEADER = "x-prompthelm-api";
+
 /**
  * Model settings published with a version, for your model call. Only the ones set in the
- * dashboard are present; for the rest, your code's defaults apply.
+ * dashboard are present; for the rest, your code's defaults apply. The request builders
+ * (`toAnthropic` and the others) put them where each API wants them.
  */
 export interface PromptConfig {
   model?: string;
@@ -37,6 +55,42 @@ export interface PromptConfig {
   maxTokens?: number;
   /** How the model must answer; absent when it answers in text. Servers before SDK 1.5 send none. */
   response?: PromptResponse;
+  // From here on, servers before SDK 1.6 send none.
+  /** Where the model is called: a provider id of PromptHelm's catalog, such as "azure". */
+  provider?: string;
+  /**
+   * The APIs the model can be called with there, as PromptHelm's catalog knows them (OpenAI's
+   * models take Responses and Chat Completions); absent when it doesn't know the model.
+   */
+  apis?: PromptApi[];
+  /** How to reach the provider, for building your client (`clientOptions`). */
+  connection?: PromptConnection;
+  /** Where the model stops writing. */
+  stop?: string[];
+  /** How long your app waits for the model, in ms. */
+  timeoutMs?: number;
+  /** How many more times your app tries a failed model call. */
+  maxRetries?: number;
+  /** Parameters of your own, passed to the provider as written. */
+  extra?: { [key: string]: unknown };
+}
+
+/** How to reach the provider; only the fields set in the dashboard are present. */
+export interface PromptConnection {
+  /** The API's address, for a proxy or a compatible server. */
+  baseUrl?: string;
+  /** Bedrock's endpoint of your own, or a Foundry resource's address. */
+  endpointUrl?: string;
+  /** Bedrock: the AWS Region. */
+  region?: string;
+  /** Bedrock: Runtime or Mantle. */
+  endpoint?: "runtime" | "mantle";
+  /** Bedrock Runtime: Converse or InvokeModel. */
+  api?: "converse" | "invoke-model";
+  /** Vertex AI: the location, such as "us-central1" or "global". */
+  location?: string;
+  /** Databricks: the workspace's address. */
+  workspaceUrl?: string;
 }
 
 /**
@@ -82,8 +136,9 @@ export interface PromptListPayload {
 }
 
 /**
- * Body of `POST /v1/reports`: what an app counted under running A/B tests since its last report.
- * Numbers only, never any text, variable value or unit.
+ * Body of `POST /v1/reports`: what an app counted under running A/B tests since its last report,
+ * and the model calls its provider refused. Numbers and error codes only, never any text,
+ * variable value or unit.
  */
 export interface ReportPayload {
   experiments: {
@@ -93,6 +148,22 @@ export interface ReportPayload {
     /** By version number. */
     versions: Record<string, ReportCounts>;
   }[];
+  /** Model calls the provider refused, by version and error (`failed`, SDK 1.6). */
+  failures?: FailureCount[];
+}
+
+/** How many calls of a version the provider refused with one error. Never its message. */
+export interface FailureCount {
+  slug: string;
+  version: number;
+  /** The HTTP status the provider answered. */
+  status: number;
+  /** The error's type, as the provider's SDK gives it apart from the message. */
+  type?: string;
+  code?: string;
+  /** The parameter it refused, where the provider names it (OpenAI). */
+  param?: string;
+  count: number;
 }
 
 export interface ReportCounts {
@@ -135,6 +206,11 @@ export interface PromptHelmOptions {
    * `reportFallbacks`.
    */
   reportResults?: boolean;
+  /**
+   * Whether `failed` tells PromptHelm, by HTTP status and error code only, that the provider
+   * refused a version's call. Defaults to `reportFallbacks`.
+   */
+  reportFailures?: boolean;
   /** Called on every `get` and `resolve`, so your analytics or traces can carry the version. */
   onResolve?: (event: ResolveEvent) => void;
 }
@@ -154,6 +230,12 @@ export interface GetOptions {
   unit?: string | number;
   /** During an A/B test, serves this side, such as the variant to your own team. Never counted. */
   force?: "control" | "variant";
+  /**
+   * The API your app calls the model with. A version whose model can't be called with it isn't
+   * served: the call gets its fallback (`api_mismatch`), and the prompt's page warns before
+   * publishing one.
+   */
+  api?: PromptApi;
 }
 
 export interface ResolveEvent {
@@ -180,6 +262,8 @@ export interface Resolved {
   config: PromptConfig;
   /** The version served, or null when the fallback was. */
   version: number | null;
+  /** The API the call asked for (`api`), which `clientOptions` builds for; null when it named none. */
+  api: PromptApi | null;
   /**
    * During an A/B test, names the test and the version this call got, so its outcome can be
    * reported later from any process: `ph.outcome(ticket, true)`. No user in it. Null otherwise.
@@ -192,7 +276,15 @@ export interface Resolved {
    * else the time since `resolve` returned. The first report counts.
    */
   usage(usage: object | null | undefined, ms?: number): void;
+  /**
+   * The provider refused the model call: pass its error. Only its HTTP status, type, code and the
+   * parameter it names are sent, never its message. The first report counts.
+   */
+  failed(error: unknown): void;
 }
+
+/** What a call gets before the API it asked for is added. */
+type Served = Omit<Resolved, "api">;
 
 interface Entry {
   version: number;
@@ -268,6 +360,10 @@ export class PromptHelm {
   readonly #inflight = new Map<string, Promise<Entry>>();
   readonly #reportFallbacks: boolean;
   readonly #reportResults: boolean;
+  readonly #reportFailures: boolean;
+  // Per slug, the API a call last asked for, sent with its requests (`API_HEADER`).
+  readonly #apis = new Map<string, PromptApi>();
+  #failures = new Map<string, FailureCount>();
   // Per slug, why the live text last couldn't be served, until a request carries it. An object,
   // so a report made while that request is in flight isn't cleared with the one it carried.
   readonly #unreported = new Map<string, { code: PromptHelmErrorCode }>();
@@ -288,6 +384,7 @@ export class PromptHelm {
     this.#onResolve = options.onResolve;
     this.#reportFallbacks = options.reportFallbacks ?? true;
     this.#reportResults = options.reportResults ?? this.#reportFallbacks;
+    this.#reportFailures = options.reportFailures ?? this.#reportFallbacks;
   }
 
   /**
@@ -307,16 +404,20 @@ export class PromptHelm {
   }
 
   async #resolve(slug: string, options: GetOptions, withUser: boolean): Promise<Resolved> {
-    const { vars, fallback } = options;
+    const { vars, fallback, api } = options;
+    if (api) this.#apis.set(slug, api);
     try {
-      return this.#pick(slug, await this.#entry(slug), options, withUser);
+      return { ...this.#pick(slug, await this.#entry(slug), options, withUser), api: api ?? null };
     } catch (error) {
       const failure = toPromptHelmError(error);
       this.#remember(slug, failure.code);
       if (fallback === undefined) throw failure;
       this.#onError(failure, slug);
       const own = typeof fallback === "string" ? { system: fallback } : fallback;
-      return this.#served(slug, fill(own.system, own.user, vars, withUser), {}, null);
+      return {
+        ...this.#served(slug, fill(own.system, own.user, vars, withUser), {}, null),
+        api: api ?? null,
+      };
     }
   }
 
@@ -335,8 +436,10 @@ export class PromptHelm {
     clearTimeout(this.#timer);
     this.#timer = undefined;
     const sent = this.#pending;
-    if (sent.size === 0) return;
+    const failures = this.#failures;
+    if (sent.size === 0 && failures.size === 0) return;
     this.#pending = new Map();
+    this.#failures = new Map();
     const body: ReportPayload = {
       experiments: [...sent.values()].map(({ id, weight, versions }) => ({
         id,
@@ -352,6 +455,7 @@ export class PromptHelm {
         ),
       })),
     };
+    if (failures.size > 0) body.failures = [...failures.values()];
     try {
       const response = await this.#fetch(`${this.#baseUrl}/v1/reports`, {
         method: "POST",
@@ -365,6 +469,11 @@ export class PromptHelm {
       // Unreachable: kept below for the next try.
     }
     // Put back what didn't arrive, adding it to anything counted meanwhile.
+    for (const [key, failure] of failures) {
+      const now = this.#failures.get(key);
+      if (now) now.count += failure.count;
+      else this.#failures.set(key, failure);
+    }
     for (const { id, weight, versions } of sent.values()) {
       for (const [version, counts] of versions) {
         const total = this.#counts({ id, weight }, version);
@@ -375,9 +484,18 @@ export class PromptHelm {
     }
   }
 
-  #pick(slug: string, entry: Entry, options: GetOptions, withUser: boolean): Resolved {
-    const { vars, unit, force } = options;
+  #pick(slug: string, entry: Entry, options: GetOptions, withUser: boolean): Served {
+    const { vars, unit, force, api } = options;
     const { experiment } = entry;
+    // A version whose model the call's API can't reach would send it a request it can't take.
+    const check = (version: number, config: PromptConfig) => {
+      if (api && config.apis && !config.apis.includes(api)) {
+        throw new PromptHelmError(
+          "api_mismatch",
+          `v${version} is called with ${config.apis.join(" or ")}, not ${api}`,
+        );
+      }
+    };
     // Calls forced to a side aren't part of the test, so they aren't counted.
     const test =
       experiment && !force ? { id: experiment.id, weight: experiment.weight } : undefined;
@@ -388,6 +506,7 @@ export class PromptHelm {
     ) {
       const { version, content, user, config = {} } = experiment.variant;
       try {
+        check(version, config);
         return this.#served(
           slug,
           fill(content, user, vars, withUser),
@@ -401,8 +520,9 @@ export class PromptHelm {
         skipped = toPromptHelmError(error);
       }
     }
-    // The live version is what the app was built for. If it can't be filled in either, the
-    // caller serves the fallback and reports that instead.
+    // The live version is what the app was built for. If it can't be filled in either, or is
+    // for another API, the caller serves the fallback and reports that instead.
+    check(entry.version, entry.config);
     const messages = fill(entry.content, entry.user, vars, withUser);
     if (skipped && experiment) {
       // Not a fallback, so not reported as one: the call got the live version.
@@ -421,7 +541,7 @@ export class PromptHelm {
     experiment?: string,
     test?: Test,
     variant = false,
-  ): Resolved {
+  ): Served {
     if (test && version !== null) add(this.#counts(test, version), SERVED, 1);
     try {
       this.#onResolve?.({ slug, version, experiment: experiment ?? null, variant });
@@ -442,6 +562,11 @@ export class PromptHelm {
         if (!test || version === null || reported & 1) return;
         reported |= 1;
         this.#outcome(test, version, value);
+      },
+      failed: (error) => {
+        if (version === null || reported & 4) return;
+        reported |= 4;
+        this.#failed(slug, version, error);
       },
       usage: (usage, ms = Date.now() - started) => {
         if (!test || version === null || reported & 2) return;
@@ -464,6 +589,19 @@ export class PromptHelm {
     add(counts, OUTCOMES, 1);
     add(counts, SCORE, score);
     add(counts, SCORE_SQ, score * score);
+  }
+
+  /** Counts a refused model call by its HTTP status and codes; anything else is ignored. */
+  #failed(slug: string, version: number, error: unknown): void {
+    if (!this.#reportFailures) return;
+    const failure = refusal(error);
+    if (!failure) return;
+    const { status, type, code, param } = failure;
+    const key = JSON.stringify([slug, version, status, type, code, param]);
+    const counted = this.#failures.get(key);
+    if (counted) counted.count += 1;
+    else this.#failures.set(key, { slug, version, ...failure, count: 1 });
+    this.#schedule();
   }
 
   /** The counts to add a call to, kept until the next report; none when reporting is off. */
@@ -529,6 +667,8 @@ export class PromptHelm {
     if (cached?.etag) headers["if-none-match"] = cached.etag;
     const report = this.#unreported.get(slug);
     if (report) headers[FALLBACK_HEADER] = report.code;
+    const api = this.#apis.get(slug);
+    if (api) headers[API_HEADER] = api;
 
     let response: Response;
     try {
@@ -585,6 +725,40 @@ function tokens(usage: Record<string, unknown>, keys: string[]): number {
     if (typeof value === "number" && value >= 0 && Number.isFinite(value)) return value;
   }
   return 0;
+}
+
+// A code or a parameter name as a provider's SDK gives it; anything else could be text.
+const CODE = /^[A-Za-z0-9_.:[\]-]{1,64}$/;
+const word = (value: unknown) =>
+  typeof value === "string" && CODE.test(value) ? value : undefined;
+
+/**
+ * What a provider's error says apart from its message: OpenAI's and Anthropic's SDKs keep
+ * `status`, `type`, `code` (Anthropic: `errorCode`) and OpenAI's `param` on the error; the AWS
+ * SDK keeps the status in `$metadata` and the type in `name`; Gemini's only the status.
+ */
+function refusal(error: unknown): Omit<FailureCount, "slug" | "version" | "count"> | null {
+  if (error === null || typeof error !== "object") return null;
+  const e = error as Record<string, unknown>;
+  const meta = e.$metadata as { httpStatusCode?: unknown } | undefined;
+  const response = e.response as { status?: unknown } | undefined;
+  const status = [e.status, e.statusCode, meta?.httpStatusCode, response?.status].find(
+    (value): value is number =>
+      Number.isInteger(value) && Number(value) >= 400 && Number(value) < 600,
+  );
+  if (status === undefined) return null;
+  const nested = (e.error !== null && typeof e.error === "object" ? e.error : {}) as Record<
+    string,
+    unknown
+  >;
+  const failure: Omit<FailureCount, "slug" | "version" | "count"> = { status };
+  const type = word(e.type) ?? word(nested.type) ?? (meta ? word(e.name) : undefined);
+  const code = word(e.code) ?? word(e.errorCode) ?? word(nested.code);
+  const param = word(e.param) ?? word(nested.param);
+  if (type) failure.type = type;
+  if (code) failure.code = code;
+  if (param) failure.param = param;
+  return failure;
 }
 
 function add(counts: number[] | undefined, index: number, amount: number): void {

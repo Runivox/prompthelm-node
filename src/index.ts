@@ -1,7 +1,22 @@
 export {
+  clientOptions,
+  type ModelRequest,
+  type RequestOptions,
+  toAnthropic,
+  toBedrockConverse,
+  toChatCompletions,
+  toGemini,
+  toOpenAIResponses,
+} from "./adapters";
+export {
+  API_HEADER,
   FALLBACK_HEADER,
+  type FailureCount,
   type GetOptions,
+  PROMPT_APIS,
+  type PromptApi,
   type PromptConfig,
+  type PromptConnection,
   type PromptExperiment,
   type PromptFallback,
   PromptHelm,

@@ -11,9 +11,13 @@ the live version or the variant for each call (`unit` keeps a user on one); `ph.
 which version it served, with its system and user messages (`system`, and `user` when the
 version has one; `get` returns the system message alone and never needs the user message's
 variables) and that version's model settings (`config`: `model`, `temperature`, `maxTokens` and,
-from 1.5, `response`, a JSON Schema for the answer; only those set in the dashboard; empty for a
-fallback), and takes the call's outcome
-and model usage, which the SDK sends to PromptHelm as totals. The package also ships `npx @prompt-helm/sdk pull`, which
+from 1.5, `response`, a JSON Schema for the answer; from 1.6, `provider`, `apis`, `connection`,
+`stop`, `timeoutMs`, `maxRetries` and `extra`; only those set in the dashboard; empty for a
+fallback), and takes the call's outcome and model usage, which the SDK sends to PromptHelm as
+totals, and the provider's refusal (`failed`). Since 1.6 `src/adapters.ts` turns a resolved
+version into each API's request (`toOpenAIResponses`, `toChatCompletions`, `toAnthropic`,
+`toGemini`, `toBedrockConverse`) and its client options (`clientOptions`): plain objects, no
+provider package, the app's own request underneath and the dashboard's settings over it. The package also ships `npx @prompt-helm/sdk pull`, which
 writes every published prompt to a fallbacks file.
 
 This repository is the SDK's only home since 2026-11-09, when it moved out of the service's
@@ -49,14 +53,20 @@ npx vitest run test/client.test.ts -t "fallback"
   that doesn't keep the process alive) or by `flush()`, kept for the next try when PromptHelm
   can't be reached or answers 5xx, and dropped when it refuses them. A variant the call can't fill
   in serves the live version and counts as `skipped`, never as a fallback. Forced calls (`force`)
-  are never counted.
+  are never counted. Since 1.6 the same report carries `failures` (`reportFailures`, which follows
+  `reportFallbacks`): a version's calls the provider refused, by HTTP status and the error's type,
+  code and parameter as its SDK gives them apart from the message (`refusal`, which takes only
+  short code-like words), never the message itself. And a call made with `api` sends that API's
+  name in `x-prompthelm-api` (`API_HEADER`); a version whose `config.apis` doesn't list it isn't
+  served (`api_mismatch`, a fallback; a variant is skipped).
 - **`content` stays the system message.** SDKs before 1.5 serve it alone, so a server must never
   move a version's system text out of it; the user message is the additive `user`.
 - **The service imports this package.** PromptHelm's server types its responses with
   `PromptPayload` (with its optional `user`, a `PromptMessage`; `config`, a `PromptConfig` with
   an optional `response`; and `experiment`, a `PromptExperiment`, whose variant has its own `user`
   and `config`) and
-  `PromptListPayload`, reads `ReportPayload` (and `latencyBucket` for its buckets), extracts
+  `PromptListPayload`, reads `ReportPayload` (with its `failures`, `FailureCount`; and
+  `latencyBucket` for its buckets), reads `API_HEADER` against `PROMPT_APIS`, extracts
   variables with `extractVariables`, reads `FALLBACK_HEADER`, and stores only a value in
   `ERROR_CODES`. Together they are the wire contract: change it here first and release, then the
   service upgrades. Never break any of them in a minor or a patch.
@@ -72,8 +82,9 @@ npx vitest run test/client.test.ts -t "fallback"
   2026-11-10, when model settings came in; "under 3 kB" from 1.3.0, "under 2 kB" before), but
   keep it small. Minified and gzipped, as bundlephobia and an app's bundler count it: 1.3.0 was
   2,742 B ESM, 2,958 B CJS; 1.4.0, with model settings, 2,770 B ESM, 2,988 B CJS; 1.5.0, with
-  the user message and the response format, 2,895 B ESM, 3,110 B CJS. Measure both
-  after a change:
+  the user message and the response format, 2,895 B ESM, 3,110 B CJS; 1.6.0, with the request
+  builders, 4,682 B ESM, 4,895 B CJS, of which an app importing only `PromptHelm` takes 3,306 B
+  (`sideEffects: false`, each builder its own export). Measure both after a change:
   `npx esbuild src/index.ts --bundle --minify --format=esm --platform=neutral | gzip -9 | wc -c`
   (and `--format=cjs`). The unminified `dist` keeps JSDoc on class members, so keep long notes
   there as `//` comments. tsup builds the two in parallel, so the library's `clean` spares
